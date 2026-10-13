@@ -21,6 +21,8 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
@@ -34,6 +36,8 @@ import kotlin.system.exitProcess
 import androidx.core.net.toUri
 import com.zyyme.workdayalarmclock.applist.AppListActivity
 import com.zyyme.workdayalarmclock.camera.AmbientBrightnessController
+import com.zyyme.workdayalarmclock.nas.WebDavClient
+import com.zyyme.workdayalarmclock.nas.WebDavException
 import com.zyyme.workdayalarmclock.notification.MeNotificationListenerService
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -60,9 +64,11 @@ class MainActivity : AppCompatActivity() {
         private const val OPEN_TODO_URL = 13
         private const val OPEN_DESK = 14
         private const val TOGGLE_COMPUTER_SPEAKER = 15
+        private const val OPEN_RECORD_SETTINGS = 16
         private const val MENU_SETTING_START = 100
         private const val REQUEST_MEDIA_SERVER_PERMISSIONS = 102
         private const val REQUEST_AMBIENT_CAMERA_PERMISSION = 103
+        private const val REQUEST_RECORD_PERMISSIONS = 104
         private const val LOG_REFRESH_DELAY_MILLIS = 250L
         private const val DPAD_CENTER_LONG_PRESS_DELAY_MS = 900L
     }
@@ -79,6 +85,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var playButton: ImageView
     private var settingsPopupMenu: PopupMenu? = null
     private var openAmbientDialogAfterPermission = false
+    private var openRecordDialogAfterPermission = false
     private var dpadPassthrough = false
     private var dpadCenterLongPressTriggered = false
     private val dpadCenterLongPressRunnable = Runnable {
@@ -313,6 +320,8 @@ class MainActivity : AppCompatActivity() {
             MeSettings.isEnabled(this, MeSettings.KEY_COMPUTER_SPEAKER)
         popupMenu.menu.findItem(CONFIG_CAMERA_AUTO_BRIGHTNESS)?.isChecked =
             MeSettings.isEnabled(this, MeSettings.KEY_CAMERA_AUTO_BRIGHTNESS)
+        popupMenu.menu.findItem(OPEN_RECORD_SETTINGS)?.title =
+            if (MeSettings.isRecordEnabled(this)) "NAS录像设置（已开启）" else "NAS录像设置"
         popupMenu.menu.findItem(TOGGLE_HOME_LAUNCHER)?.isChecked =
             isHomeLauncherEnabled()
         popupMenu.show()    }
@@ -348,7 +357,8 @@ class MainActivity : AppCompatActivity() {
         popupMenu.menu.add(Menu.NONE, CONFIG_CAMERA_AUTO_BRIGHTNESS, MENU_SETTING_START + settingsMenuItems.size + 7, "摄像头自动亮度").apply {
             isCheckable = true
         }
-        popupMenu.menu.add(Menu.NONE, OPEN_DEVELOPER_OPTIONS, MENU_SETTING_START + settingsMenuItems.size + 8, "开发者选项")
+        popupMenu.menu.add(Menu.NONE, OPEN_RECORD_SETTINGS, MENU_SETTING_START + settingsMenuItems.size + 8, "NAS录像设置")
+        popupMenu.menu.add(Menu.NONE, OPEN_DEVELOPER_OPTIONS, MENU_SETTING_START + settingsMenuItems.size + 9, "开发者选项")
 
         popupMenu.setOnMenuItemClickListener { menuItem ->
             if (menuItem.itemId == MENU_EXIT) {
@@ -395,6 +405,9 @@ class MainActivity : AppCompatActivity() {
                 return@setOnMenuItemClickListener true
             } else if (menuItem.itemId == CONFIG_CAMERA_AUTO_BRIGHTNESS) {
                 showCameraAutoBrightnessDialog()
+                return@setOnMenuItemClickListener true
+            } else if (menuItem.itemId == OPEN_RECORD_SETTINGS) {
+                showRecordSettingsDialog()
                 return@setOnMenuItemClickListener true
             } else if (menuItem.itemId == OPEN_DEVELOPER_OPTIONS) {
                 openDeveloperOptions()
@@ -587,6 +600,290 @@ class MainActivity : AppCompatActivity() {
                 }
                 MeSettings.setCameraPassword(this, password)
                 MeService.me?.updateCameraPassword()
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+    }
+
+    private fun showRecordSettingsDialog() {
+        val density = resources.displayMetrics.density
+        val padH = (20 * density).toInt()
+        val padTop = (10 * density).toInt()
+        val padSmall = (6 * density).toInt()
+
+        fun sectionLabel(textValue: String) = TextView(this).apply {
+            text = textValue
+            textSize = 14f
+            setPadding(0, padTop, 0, padSmall)
+        }
+
+        fun textInput(hintValue: String, current: String, passwordStyle: Boolean = false) =
+            EditText(this).apply {
+                hint = hintValue
+                setSingleLine(true)
+                inputType = if (passwordStyle) {
+                    InputType.TYPE_CLASS_TEXT or
+                        InputType.TYPE_TEXT_VARIATION_PASSWORD or
+                        InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                } else {
+                    InputType.TYPE_CLASS_TEXT or
+                        InputType.TYPE_TEXT_VARIATION_URI or
+                        InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                }
+                setText(current)
+                setSelection(text.length)
+            }
+
+        fun numberInput(current: Int) = EditText(this).apply {
+            hint = current.toString()
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(current.toString())
+            setSelection(text.length)
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(padH, 0, padH, 0)
+        }
+
+        val enabledSwitch = Switch(this).apply {
+            text = "开启 NAS 录像（每分钟一个文件）"
+            isChecked = MeSettings.isRecordEnabled(this@MainActivity)
+        }
+        container.addView(enabledSwitch)
+
+        container.addView(sectionLabel("WebDAV 服务器地址（例如 http://192.168.1.10:5005）"))
+        val urlInput = textInput("http://nas地址:端口", MeSettings.getWebDavUrl(this))
+        container.addView(urlInput)
+
+        container.addView(sectionLabel("账号（无鉴权可留空）"))
+        val usernameInput = textInput("WebDAV 账号", MeSettings.getWebDavUsername(this))
+        container.addView(usernameInput)
+
+        container.addView(sectionLabel("密码（无鉴权可留空）"))
+        val passwordInput = textInput("WebDAV 密码", MeSettings.getWebDavPassword(this), true)
+        container.addView(passwordInput)
+
+        container.addView(sectionLabel("录像存放目录（相对地址，可留空存到根目录）"))
+        val dirInput = textInput("例如 monitor/recordings", MeSettings.getWebDavDir(this))
+        container.addView(dirInput)
+
+        val testButton = android.widget.Button(this).apply {
+            text = "测试连接"
+        }
+        val testStatus = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, padSmall, 0, 0)
+        }
+        container.addView(testButton)
+        container.addView(testStatus)
+
+        container.addView(sectionLabel("录像清晰度"))
+        val heightGroup = RadioGroup(this)
+        val height720 = RadioButton(this).apply { text = "720p"; id = 720 }
+        val height1080 = RadioButton(this).apply { text = "1080p"; id = 1080 }
+        heightGroup.addView(height720)
+        heightGroup.addView(height1080)
+        heightGroup.check(
+            if (MeSettings.getRecordHeight(this) == MeSettings.RECORD_HEIGHT_720) 720 else 1080
+        )
+        container.addView(heightGroup)
+
+        container.addView(sectionLabel("摄像头序号（多摄像头设备可切换，默认 0）"))
+        val cameraIndexInput = numberInput(MeSettings.getRecordCameraIndex(this))
+        container.addView(cameraIndexInput)
+
+        val audioSwitch = Switch(this).apply {
+            text = "录制声音"
+            isChecked = MeSettings.isRecordAudioEnabled(this@MainActivity)
+            setPadding(0, padTop, 0, 0)
+        }
+        container.addView(audioSwitch)
+
+        container.addView(sectionLabel("NAS 空间限制方式"))
+        val quotaGroup = RadioGroup(this)
+        val reserveRadio = RadioButton(this).apply {
+            text = "保留可用空间（可用空间不足时删除最早录像）"
+            id = MeSettings.QUOTA_MODE_RESERVE
+        }
+        val limitRadio = RadioButton(this).apply {
+            text = "限制录像占用空间（超出后删除最早录像）"
+            id = MeSettings.QUOTA_MODE_LIMIT
+        }
+        quotaGroup.addView(reserveRadio)
+        quotaGroup.addView(limitRadio)
+        quotaGroup.check(MeSettings.getQuotaMode(this))
+        container.addView(quotaGroup)
+
+        container.addView(sectionLabel("保留可用空间（MB，默认 1024 = 1GB）"))
+        val reserveInput = numberInput(MeSettings.getQuotaReserveMb(this))
+        container.addView(reserveInput)
+
+        container.addView(sectionLabel("录像占用上限（MB，默认 10240 = 10GB）"))
+        val limitInput = numberInput(MeSettings.getQuotaLimitMb(this))
+        container.addView(limitInput)
+
+        container.addView(sectionLabel("本机待上传缓存上限（MB，默认 512）"))
+        val cacheInput = numberInput(MeSettings.getLocalCacheMb(this))
+        container.addView(cacheInput)
+
+        fun updateQuotaFieldState() {
+            val reserveMode = quotaGroup.checkedRadioButtonId == MeSettings.QUOTA_MODE_RESERVE
+            reserveInput.isEnabled = reserveMode
+            limitInput.isEnabled = !reserveMode
+        }
+        quotaGroup.setOnCheckedChangeListener { _, _ -> updateQuotaFieldState() }
+        updateQuotaFieldState()
+
+        container.addView(TextView(this).apply {
+            text = "手机浏览器访问 http://设备IP:8880/recordings 可查看和下载录像。"
+            textSize = 12f
+            setPadding(0, padTop, 0, 0)
+        })
+
+        val scroll = ScrollView(this).apply { addView(container) }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("NAS录像设置")
+            .setView(scroll)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存", null)
+            .create()
+
+        testButton.setOnClickListener {
+            val url = urlInput.text.toString().trim().trimEnd('/')
+            if (!url.startsWith("http://", ignoreCase = true) &&
+                !url.startsWith("https://", ignoreCase = true)
+            ) {
+                testStatus.text = "地址需以 http:// 或 https:// 开头"
+                return@setOnClickListener
+            }
+            testStatus.text = "正在连接…"
+            testButton.isEnabled = false
+            val username = usernameInput.text.toString().trim()
+            val password = passwordInput.text.toString()
+            val dir = dirInput.text.toString().trim().trim('/')
+            Thread {
+                var success = false
+                var message = ""
+                try {
+                    val client = WebDavClient(url, username, password)
+                    client.testConnection()
+                    if (dir.isNotEmpty()) {
+                        client.mkdirs(dir)
+                    }
+                    success = true
+                } catch (e: WebDavException) {
+                    message = e.message ?: "连接失败"
+                } catch (e: Exception) {
+                    message = "连接失败：${e.message ?: e.javaClass.simpleName}"
+                }
+                val finalMessage = message
+                runOnUiThread {
+                    testButton.isEnabled = true
+                    testStatus.text = if (success) {
+                        "连接成功" + if (dir.isNotEmpty()) "，目录可访问" else ""
+                    } else {
+                        finalMessage
+                    }
+                }
+            }.start()
+        }
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val url = urlInput.text.toString().trim().trimEnd('/')
+                if (url.isNotEmpty() &&
+                    !url.startsWith("http://", ignoreCase = true) &&
+                    !url.startsWith("https://", ignoreCase = true)
+                ) {
+                    urlInput.error = "地址需以 http:// 或 https:// 开头"
+                    return@setOnClickListener
+                }
+                if (url.isEmpty() && enabledSwitch.isChecked) {
+                    urlInput.error = "开启录像必须填写 WebDAV 地址"
+                    return@setOnClickListener
+                }
+                val cameraIndex = cameraIndexInput.text.toString().ifEmpty { "0" }.toIntOrNull()
+                if (cameraIndex == null || cameraIndex < 0) {
+                    cameraIndexInput.error = "请输入大于等于0的序号"
+                    return@setOnClickListener
+                }
+                val reserveMb = reserveInput.text.toString()
+                    .ifEmpty { MeSettings.DEFAULT_QUOTA_RESERVE_MB.toString() }
+                    .toIntOrNull()
+                if (reserveMb == null || reserveMb <= 0) {
+                    reserveInput.error = "请输入大于0的MB数"
+                    return@setOnClickListener
+                }
+                val limitMb = limitInput.text.toString()
+                    .ifEmpty { MeSettings.DEFAULT_QUOTA_LIMIT_MB.toString() }
+                    .toIntOrNull()
+                if (limitMb == null || limitMb <= 0) {
+                    limitInput.error = "请输入大于0的MB数"
+                    return@setOnClickListener
+                }
+                val cacheMb = cacheInput.text.toString()
+                    .ifEmpty { MeSettings.DEFAULT_LOCAL_CACHE_MB.toString() }
+                    .toIntOrNull()
+                if (cacheMb == null || cacheMb <= 0) {
+                    cacheInput.error = "请输入大于0的MB数"
+                    return@setOnClickListener
+                }
+
+                MeSettings.setWebDavUrl(this, url)
+                MeSettings.setWebDavUsername(this, usernameInput.text.toString())
+                MeSettings.setWebDavPassword(this, passwordInput.text.toString())
+                MeSettings.setWebDavDir(this, dirInput.text.toString())
+                MeSettings.setRecordHeight(this, if (heightGroup.checkedRadioButtonId == 720) {
+                    MeSettings.RECORD_HEIGHT_720
+                } else {
+                    MeSettings.RECORD_HEIGHT_1080
+                })
+                MeSettings.setRecordCameraIndex(this, cameraIndex)
+                MeSettings.setRecordAudioEnabled(this, audioSwitch.isChecked)
+                MeSettings.setQuotaMode(this, quotaGroup.checkedRadioButtonId)
+                MeSettings.setQuotaReserveMb(this, reserveMb)
+                MeSettings.setQuotaLimitMb(this, limitMb)
+                MeSettings.setLocalCacheMb(this, cacheMb)
+                MeSettings.setRecordEnabled(this, enabledSwitch.isChecked)
+
+                settingsPopupMenu?.menu?.findItem(OPEN_RECORD_SETTINGS)?.title =
+                    if (enabledSwitch.isChecked) "NAS录像设置（已开启）" else "NAS录像设置"
+
+                val wantRecord = enabledSwitch.isChecked && url.isNotEmpty()
+                if (wantRecord && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    val missing = buildList {
+                        if (ActivityCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.CAMERA
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            add(Manifest.permission.CAMERA)
+                        }
+                        if (audioSwitch.isChecked &&
+                            ActivityCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.RECORD_AUDIO
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            add(Manifest.permission.RECORD_AUDIO)
+                        }
+                    }
+                    if (missing.isNotEmpty()) {
+                        openRecordDialogAfterPermission = true
+                        ActivityCompat.requestPermissions(
+                            this@MainActivity,
+                            missing.toTypedArray(),
+                            REQUEST_RECORD_PERMISSIONS
+                        )
+                    } else {
+                        MeService.me?.syncCameraServerSetting()
+                    }
+                } else {
+                    MeService.me?.syncCameraServerSetting()
+                }
                 dialog.dismiss()
             }
         }
@@ -855,6 +1152,20 @@ class MainActivity : AppCompatActivity() {
             } else if (!granted) {
                 Toast.makeText(this, "摄像头权限未授权，无法使用自动亮度", Toast.LENGTH_LONG).show()
             }
+            return
+        }
+        if (requestCode == REQUEST_RECORD_PERMISSIONS) {
+            openRecordDialogAfterPermission = false
+            val cameraGranted = ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!cameraGranted) {
+                MeSettings.setRecordEnabled(this, false)
+                settingsPopupMenu?.menu?.findItem(OPEN_RECORD_SETTINGS)?.title = "NAS录像设置"
+                Toast.makeText(this, "摄像头权限未授权，NAS录像无法开启", Toast.LENGTH_LONG).show()
+            }
+            MeService.me?.syncCameraServerSetting()
             return
         }
         if (requestCode != REQUEST_MEDIA_SERVER_PERMISSIONS) return

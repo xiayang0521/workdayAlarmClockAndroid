@@ -26,9 +26,13 @@ import androidx.core.view.WindowInsetsCompat
 import com.zyyme.workdayalarmclock.ClockActivity
 import com.zyyme.workdayalarmclock.DeskActivity
 import com.zyyme.workdayalarmclock.MeService
+import com.zyyme.workdayalarmclock.record.RecordingAccess
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.InputStream
 import java.io.InputStreamReader
+import java.io.OutputStream
+import java.io.RandomAccessFile
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -36,6 +40,12 @@ import java.net.SocketException
 import java.nio.charset.Charset
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+
+internal class CameraStreamToken(
+    @Volatile var videoPipeline: CameraStreamPipeline?,
+    @Volatile var audioPipeline: AacAudioPipeline?,
+    @Volatile var invalid: Boolean = false
+)
 
 @Suppress("DEPRECATION")
 internal class CameraHttpServer(
@@ -63,8 +73,11 @@ internal class CameraHttpServer(
     private val streamLockState = Any()
     private val clients = LinkedHashMap<Socket, CameraStreamPipeline>()
     private val audioClients = LinkedHashSet<Socket>()
+    private var recordingVideoToken: CameraStreamToken? = null
+    private var recordingAudio = false
     private val framebufferStreamActive = AtomicBoolean(false)
     @Volatile private var password = ""
+    @Volatile private var recordingAccess: RecordingAccess? = null
     private var serverSocket: ServerSocket? = null
     private var acceptThread: Thread? = null
     @Volatile private var activeFramebufferSocket: Socket? = null
@@ -101,6 +114,10 @@ internal class CameraHttpServer(
             log("摄像头HTTP服务启动失败：${e.message}")
             false
         }
+    }
+
+    fun setRecordingAccess(access: RecordingAccess?) {
+        recordingAccess = access
     }
 
     fun updatePassword(cameraPassword: String) {
@@ -189,6 +206,9 @@ internal class CameraHttpServer(
                 meBgCamCtrl.handle(socket, request.method, request.uri)
                 return
             }
+            if (handleRecordingRoute(socket, request, path)) {
+                return
+            }
             if (!cameraEnabled()) {
                 writeEmptyResponse(socket, 404, "Not Found")
                 return
@@ -260,7 +280,8 @@ internal class CameraHttpServer(
         val uri: Uri,
         val body: InputStream,
         val expectContinue: Boolean,
-        val contentType: String?
+        val contentType: String?,
+        val rangeHeader: String?
     )
 
     private fun readRequest(socket: Socket): HttpRequest? {
@@ -273,21 +294,26 @@ internal class CameraHttpServer(
         var chunked = false
         var expectContinue = false
         var contentType: String? = null
+        var rangeHeader: String? = null
         while (true) {
             val line = readHttpLine(input) ?: return null
             if (line.isEmpty()) break
             headerCount++
             if (headerCount > 100) return null
-            if (line.substringBefore(':').trim().equals("Transfer-Encoding", ignoreCase = true)) {
-                chunked = line.substringAfter(':').trim().split(',')
+            val headerName = line.substringBefore(':').trim()
+            val headerValue = line.substringAfter(':', "").trim()
+            if (headerName.equals("Transfer-Encoding", ignoreCase = true)) {
+                chunked = headerValue.split(',')
                     .any { it.trim().equals("chunked", ignoreCase = true) }
             }
-            if (line.substringBefore(':').trim().equals("Expect", ignoreCase = true)) {
-                expectContinue = line.substringAfter(':').trim()
-                    .equals("100-continue", ignoreCase = true)
+            if (headerName.equals("Expect", ignoreCase = true)) {
+                expectContinue = headerValue.equals("100-continue", ignoreCase = true)
             }
-            if (line.substringBefore(':').trim().equals("Content-Type", ignoreCase = true)) {
-                contentType = line.substringAfter(':').trim()
+            if (headerName.equals("Content-Type", ignoreCase = true)) {
+                contentType = headerValue
+            }
+            if (headerName.equals("Range", ignoreCase = true)) {
+                rangeHeader = headerValue
             }
         }
 
@@ -298,7 +324,15 @@ internal class CameraHttpServer(
         }
         if (uri.fragment != null) return null
         val body = if (chunked) ChunkedInputStream(input) else input
-        return HttpRequest(parts[0], uri.path.toString(), uri, body, expectContinue, contentType)
+        return HttpRequest(
+            parts[0],
+            uri.path.toString(),
+            uri,
+            body,
+            expectContinue,
+            contentType,
+            rangeHeader
+        )
     }
 
     private fun writeFramebufferInfo(socket: Socket) {
@@ -908,9 +942,12 @@ internal class CameraHttpServer(
             if (!running.get()) return null
 
             val current = synchronized(stateLock) { activePipeline }
-            if (current != null && current.key == key) {
-                synchronized(stateLock) { clients[socket] = current }
-                return current
+            if (current != null) {
+                val recorderToken = recordingVideoToken
+                if (current.key == key || recorderToken?.videoPipeline === current) {
+                    synchronized(stateLock) { clients[socket] = current }
+                    return current
+                }
             }
 
             closeActiveSessionLocked()
@@ -942,6 +979,139 @@ internal class CameraHttpServer(
                 MjpegCameraPipeline(key, log, brightness::updateLuma)
             }
             CameraStreamFormat.AVC -> AvcCameraPipeline(appContext, key, log)
+        }
+    }
+
+    /**
+     * 录像专用会话获取：不依赖 Socket，不受 HTTP 观看者断开影响。
+     * 启动后会抢占/复用当前视频管线；返回的 token 用于释放。
+     */
+    fun acquireRecordingSession(key: CameraStreamKey, withAudio: Boolean): CameraStreamToken? {
+        val token = CameraStreamToken(null, null)
+        var startedNewVideo = false
+        synchronized(sessionChangeLock) {
+            if (!running.get()) return null
+            val current = synchronized(stateLock) { activePipeline }
+            if (current != null && current.key == key) {
+                token.videoPipeline = current
+            } else {
+                closeActiveSessionLocked()
+                brightness.onIpCameraStarting()
+                if (!running.get()) return null
+                val newPipeline = createPipeline(key)
+                if (!newPipeline.start()) {
+                    newPipeline.stop()
+                    brightness.onIpCameraStopped()
+                    return null
+                }
+                if (!running.get()) {
+                    newPipeline.stop()
+                    brightness.onIpCameraStopped()
+                    return null
+                }
+                synchronized(stateLock) {
+                    activePipeline = newPipeline
+                    token.videoPipeline = newPipeline
+                }
+                acquireStreamLocks()
+                startedNewVideo = true
+            }
+            recordingVideoToken = token
+        }
+
+        if (withAudio) {
+            val audioPipeline = acquireRecordingAudio()
+            if (audioPipeline == null) {
+                synchronized(sessionChangeLock) {
+                    if (recordingVideoToken === token) recordingVideoToken = null
+                    token.invalid = true
+                    if (startedNewVideo) {
+                        val pipeline = token.videoPipeline
+                        if (pipeline != null && clients.isEmpty()) {
+                            synchronized(stateLock) { activePipeline = null }
+                            pipeline.stop()
+                            releaseStreamLocks()
+                            brightness.onIpCameraStopped()
+                        }
+                    }
+                }
+                return null
+            }
+            token.audioPipeline = audioPipeline
+        }
+        return token
+    }
+
+    private fun acquireRecordingAudio(): AacAudioPipeline? {
+        synchronized(audioSessionChangeLock) {
+            if (!running.get() || !canStreamMicrophone()) return null
+            val existing = synchronized(stateLock) { activeAudioPipeline }
+            if (existing != null) {
+                recordingAudio = true
+                return existing
+            }
+            val pipeline = AacAudioPipeline(log)
+            if (!pipeline.start()) {
+                pipeline.stop()
+                return null
+            }
+            if (!running.get()) {
+                pipeline.stop()
+                return null
+            }
+            synchronized(stateLock) {
+                activeAudioPipeline = pipeline
+                recordingAudio = true
+            }
+            acquireStreamLocks()
+            return pipeline
+        }
+    }
+
+    fun releaseRecordingSession(token: CameraStreamToken) {
+        synchronized(sessionChangeLock) {
+            if (recordingVideoToken === token) {
+                recordingVideoToken = null
+            }
+            token.invalid = true
+            val pipeline = token.videoPipeline
+            if (pipeline != null && activePipeline === pipeline && clients.isEmpty()) {
+                synchronized(stateLock) { activePipeline = null }
+                pipeline.stop()
+                releaseStreamLocks()
+                brightness.onIpCameraStopped()
+            }
+        }
+        synchronized(audioSessionChangeLock) {
+            if (recordingAudio && token.audioPipeline != null) {
+                recordingAudio = false
+                val pipeline = synchronized(stateLock) { activeAudioPipeline }
+                if (pipeline != null && audioClients.isEmpty()) {
+                    synchronized(stateLock) { activeAudioPipeline = null }
+                    pipeline.stop()
+                    releaseStreamLocks()
+                }
+            }
+        }
+    }
+
+    /**
+     * 录像运行中切换"是否录音"。
+     */
+    fun setRecordingAudioEnabled(token: CameraStreamToken, withAudio: Boolean) {
+        if (withAudio && token.audioPipeline == null) {
+            token.audioPipeline = acquireRecordingAudio()
+        } else if (!withAudio && token.audioPipeline != null) {
+            synchronized(audioSessionChangeLock) {
+                if (recordingAudio) recordingAudio = false
+                val pipeline = activeAudioPipeline
+                token.audioPipeline = null
+                if (pipeline != null && audioClients.isEmpty()) {
+                    synchronized(stateLock) { activeAudioPipeline = null }
+                    pipeline.stop()
+                    releaseStreamLocks()
+                }
+            }
         }
     }
 
@@ -979,7 +1149,9 @@ internal class CameraHttpServer(
             var shouldStop = false
             synchronized(stateLock) {
                 audioClients.remove(socket)
-                if (activeAudioPipeline === pipeline && audioClients.isEmpty()) {
+                if (activeAudioPipeline === pipeline &&
+                    audioClients.isEmpty() && !recordingAudio
+                ) {
                     activeAudioPipeline = null
                     shouldStop = true
                 }
@@ -1000,6 +1172,8 @@ internal class CameraHttpServer(
                 audioClients.clear()
                 Pair(pipeline, sockets)
             }
+            recordingVideoToken?.audioPipeline = null
+            recordingAudio = false
             session.second.forEach { socket ->
                 try {
                     socket.close()
@@ -1019,7 +1193,9 @@ internal class CameraHttpServer(
             var shouldStop = false
             synchronized(stateLock) {
                 clients.remove(socket)
-                if (activePipeline === pipeline && clients.values.none { it === pipeline }) {
+                val recorderKeeps = recordingVideoToken != null &&
+                    recordingVideoToken?.videoPipeline === pipeline
+                if (activePipeline === pipeline && clients.isEmpty() && !recorderKeeps) {
                     activePipeline = null
                     shouldStop = true
                 }
@@ -1045,6 +1221,11 @@ internal class CameraHttpServer(
             val sockets = clients.keys.toList()
             clients.clear()
             Pair(pipeline, sockets)
+        }
+        recordingVideoToken?.let { token ->
+            token.invalid = true
+            token.videoPipeline = null
+            recordingVideoToken = null
         }
         session.second.forEach {
             try {
@@ -1143,6 +1324,249 @@ internal class CameraHttpServer(
             output.write(muxer.mediaFragment(packet))
             output.flush()
         }
+    }
+
+    private fun handleRecordingRoute(
+        socket: Socket,
+        request: HttpRequest,
+        path: String?
+    ): Boolean {
+        if (path == null) return false
+        if (request.method != "GET") {
+            if (path == "/recordings" ||
+                path.startsWith("/recordings/") ||
+                path.endsWith("/rec/list") ||
+                path.contains("/rec/file/")
+            ) {
+                writeEmptyResponse(socket, 405, "Method Not Allowed")
+                return true
+            }
+            return false
+        }
+        if (path == "/recordings") {
+            writeRecordingsPage(socket)
+            return true
+        }
+        val prefix = if (password.isEmpty()) "" else "/$password"
+        if (path == "$prefix/rec/list") {
+            writeRecordingList(socket)
+            return true
+        }
+        val filePrefix = "$prefix/rec/file/"
+        if (path.startsWith(filePrefix)) {
+            val name = Uri.decode(path.substring(filePrefix.length))
+            val asDownload = request.uri.getQueryParameter("download") == "1"
+            writeRecordingFile(socket, name, request.rangeHeader, asDownload)
+            return true
+        }
+        return false
+    }
+
+    private fun writeRecordingList(socket: Socket) {
+        val access = recordingAccess
+        if (access == null) {
+            writeEmptyResponse(socket, 404, "Not Found")
+            return
+        }
+        val array = org.json.JSONArray()
+        access.listRecordings().forEach { info ->
+            array.put(
+                org.json.JSONObject()
+                    .put("name", info.name)
+                    .put("size", info.size)
+                    .put("time", info.timestampMs)
+                    .put("local", info.local)
+            )
+        }
+        val body = array.toString().toByteArray(HTML_CHARSET)
+        val header = "HTTP/1.0 200 OK\r\n" +
+            "Connection: close\r\n" +
+            "Cache-Control: no-cache, no-store\r\n" +
+            "Content-Type: application/json; charset=utf-8\r\n" +
+            "Content-Length: ${body.size}\r\n\r\n"
+        val output = socket.getOutputStream()
+        output.write(header.toByteArray(HTTP_CHARSET))
+        output.write(body)
+        output.flush()
+    }
+
+    private fun writeRecordingFile(
+        socket: Socket,
+        name: String,
+        rangeHeader: String?,
+        asDownload: Boolean
+    ) {
+        val access = recordingAccess
+        if (access == null) {
+            writeEmptyResponse(socket, 404, "Not Found")
+            return
+        }
+        val handle = access.openForRead(name, rangeHeader)
+        if (handle == null) {
+            writeEmptyResponse(socket, 404, "Not Found")
+            return
+        }
+        try {
+            socket.soTimeout = 30_000
+            if (handle.local != null) {
+                streamLocalRecording(socket, handle.local, rangeHeader, name, asDownload)
+            } else {
+                streamRemoteRecording(socket, handle.connection!!, name, asDownload)
+            }
+        } finally {
+            handle.close()
+        }
+    }
+
+    private fun streamLocalRecording(
+        socket: Socket,
+        file: File,
+        rangeHeader: String?,
+        name: String,
+        asDownload: Boolean
+    ) {
+        val length = file.length()
+        if (length <= 0L) {
+            writeEmptyResponse(socket, 404, "Not Found")
+            return
+        }
+        val range = parseByteRange(rangeHeader, length)
+        var raf: RandomAccessFile? = null
+        try {
+            raf = RandomAccessFile(file, "r")
+            val output = socket.getOutputStream()
+            val disposition = if (asDownload) "attachment" else "inline"
+            if (range == null) {
+                val header = "HTTP/1.0 200 OK\r\n" +
+                    "Connection: close\r\n" +
+                    "Content-Type: video/mp4\r\n" +
+                    "Accept-Ranges: bytes\r\n" +
+                    "Content-Disposition: $disposition; filename=\"$name\"\r\n" +
+                    "Content-Length: $length\r\n\r\n"
+                output.write(header.toByteArray(HTTP_CHARSET))
+                copyStream(raf, output, 0L, length)
+            } else {
+                val start = range.first
+                val end = range.second
+                val contentLength = end - start + 1
+                val header = "HTTP/1.0 206 Partial Content\r\n" +
+                    "Connection: close\r\n" +
+                    "Content-Type: video/mp4\r\n" +
+                    "Accept-Ranges: bytes\r\n" +
+                    "Content-Disposition: $disposition; filename=\"$name\"\r\n" +
+                    "Content-Range: bytes $start-$end/${length - 1}\r\n" +
+                    "Content-Length: $contentLength\r\n\r\n"
+                output.write(header.toByteArray(HTTP_CHARSET))
+                copyStream(raf, output, start, contentLength)
+            }
+            output.flush()
+        } finally {
+            try {
+                raf?.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun copyStream(
+        raf: RandomAccessFile,
+        output: OutputStream,
+        start: Long,
+        count: Long
+    ) {
+        raf.seek(start)
+        val buffer = ByteArray(32 * 1024)
+        var remaining = count
+        while (remaining > 0L) {
+            val toRead = if (remaining > buffer.size) buffer.size else remaining.toInt()
+            val read = raf.read(buffer, 0, toRead)
+            if (read <= 0) break
+            output.write(buffer, 0, read)
+            remaining -= read
+        }
+    }
+
+    private fun streamRemoteRecording(
+        socket: Socket,
+        connection: java.net.HttpURLConnection,
+        name: String,
+        asDownload: Boolean
+    ) {
+        val statusCode = connection.responseCode
+        val input = try {
+            connection.inputStream
+        } catch (_: Exception) {
+            connection.errorStream
+        }
+        if (input == null) {
+            writeEmptyResponse(socket, 502, "Bad Gateway")
+            return
+        }
+        val reason = if (statusCode == 206) "Partial Content" else "OK"
+        val contentLength = connection.getHeaderField("Content-Length") ?: "-1"
+        val contentRange = connection.getHeaderField("Content-Range")
+        val disposition = if (asDownload) "attachment" else "inline"
+        var header = "HTTP/1.0 $statusCode $reason\r\n" +
+            "Connection: close\r\n" +
+            "Content-Type: video/mp4\r\n" +
+            "Accept-Ranges: bytes\r\n" +
+            "Content-Disposition: $disposition; filename=\"$name\"\r\n" +
+            "Content-Length: $contentLength\r\n"
+        if (contentRange != null) {
+            header += "Content-Range: $contentRange\r\n"
+        }
+        val output = socket.getOutputStream()
+        output.write((header + "\r\n").toByteArray(HTTP_CHARSET))
+        val buffer = ByteArray(32 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read <= 0) break
+            output.write(buffer, 0, read)
+        }
+        output.flush()
+        try {
+            input.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun parseByteRange(rangeHeader: String?, length: Long): Pair<Long, Long>? {
+        if (rangeHeader == null) return null
+        val value = rangeHeader.trim()
+        if (!value.startsWith("bytes=")) return null
+        val spec = value.substring("bytes=".length).substringBefore(',').trim()
+        val dash = spec.indexOf('-')
+        if (dash < 0) return null
+        val startText = spec.substring(0, dash).trim()
+        val endText = spec.substring(dash + 1).trim()
+        val start: Long
+        var end: Long
+        if (startText.isEmpty()) {
+            val suffix = endText.toLongOrNull() ?: return null
+            if (suffix <= 0L) return null
+            start = (length - suffix).coerceAtLeast(0L)
+            end = length - 1
+        } else {
+            start = startText.toLongOrNull() ?: return null
+            end = if (endText.isEmpty()) length - 1 else (endText.toLongOrNull() ?: return null)
+            if (start < 0L || start >= length) return null
+            end = end.coerceAtMost(length - 1)
+        }
+        if (end < start) return null
+        return start to end
+    }
+
+    private fun writeRecordingsPage(socket: Socket) {
+        val body = RECORDINGS_PAGE.toByteArray(HTML_CHARSET)
+        val header = "HTTP/1.0 200 OK\r\n" +
+            "Connection: close\r\n" +
+            "Cache-Control: no-cache, no-store\r\n" +
+            "Content-Type: text/html; charset=utf-8\r\n" +
+            "Content-Length: ${body.size}\r\n\r\n"
+        val output = socket.getOutputStream()
+        output.write(header.toByteArray(HTTP_CHARSET))
+        output.write(body)
+        output.flush()
     }
 
     private fun writePlayerPage(socket: Socket) {
@@ -1255,6 +1679,7 @@ video,#mjpeg{display:block;width:100%;height:100%;object-fit:contain;transform-o
 </div>
 <button id="playStop" type="submit">播放</button>
 <button id="rotate" type="button" aria-label="旋转画面">旋转 0°</button>
+<a href="/recordings" style="flex:0 1 110px;min-height:42px;display:flex;align-items:center;justify-content:center;border:1px solid #278bd2;border-radius:4px;background:#1769aa;color:#eee;text-decoration:none;font-size:16px">录像</a>
 </form>
 <div id="videoFrame"><video id="video" controls autoplay muted playsinline></video></div>
 <div id="videoStatus" class="status"></div>
@@ -1398,6 +1823,102 @@ try{
   if(savedVideo!==null)playVideo.checked=savedVideo==='true';if(savedAudio!==null)playAudio.checked=savedAudio==='true';
 }catch(error){}
 updateVideoShape();
+</script>
+</body>
+</html>
+"""
+
+    private val RECORDINGS_PAGE = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>咩监控录像</title>
+<style>
+*{box-sizing:border-box}body{font-family:sans-serif;margin:0 auto;max-width:760px;padding:12px;background:#0d1117;color:#eee}
+h1{font-size:18px;margin:4px 0 12px}
+.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.bar input{flex:1 1 140px;min-width:0;min-height:42px;font-size:16px;padding:8px 10px;border:1px solid #555;border-radius:6px;background:#161b22;color:#eee}
+button{min-height:40px;padding:8px 14px;font-size:15px;border:1px solid #278bd2;border-radius:6px;background:#1769aa;color:#fff;cursor:pointer}
+button.ghost{background:#21262d;border-color:#444}
+#status{margin:10px 0;color:#9aa4b0;min-height:1.2em;font-size:14px}
+#player{width:100%;background:#000;border-radius:8px;margin-bottom:12px;max-height:60vh}
+ul{list-style:none;margin:0;padding:0}
+li{display:flex;align-items:center;gap:10px;padding:11px 8px;border-bottom:1px solid #21262d}
+.meta{flex:1;min-width:0}.meta .t{font-size:15px;word-break:break-all}.meta .s{font-size:12px;color:#8b949e;margin-top:3px}
+.badge{font-size:11px;padding:1px 6px;border-radius:10px;margin-left:6px}
+.badge.local{background:#1769aa}.badge.nas{background:#5a3e00;color:#ffc76b}
+.act{display:flex;gap:8px;flex-shrink:0}.act a,.act button{min-height:36px;padding:6px 12px;font-size:14px;text-decoration:none;border-radius:6px}
+.act a{border:1px solid #444;color:#eee;background:#21262d}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<h1>监控录像</h1>
+<div class="bar">
+<input id="password" type="text" autocomplete="off" placeholder="访问密码（无密码可留空）">
+<button id="load">加载录像</button>
+<button id="refresh" class="ghost">刷新</button>
+<button id="live" class="ghost">看实时</button>
+</div>
+<div id="status"></div>
+<video id="player" controls playsinline hidden></video>
+<ul id="list"></ul>
+<script>
+var passwordInput=document.getElementById('password'),statusNode=document.getElementById('status');
+var listNode=document.getElementById('list'),player=document.getElementById('player');
+function apiPrefix(){var p=passwordInput.value.trim().replace(/^\/+|\/+$/g,'');return p?encodeURIComponent(p)+'/':'';}
+function setStatus(text){statusNode.textContent=text||'';}
+function formatSize(bytes){if(!bytes)return '0 B';var u=['B','KB','MB','GB'],i=Math.min(u.length-1,Math.floor(Math.log(bytes)/Math.log(1024)));return (bytes/Math.pow(1024,i)).toFixed(i?1:0)+' '+u[i];}
+function formatTime(ms){try{return new Date(ms).toLocaleString();}catch(e){return String(ms);}}
+function stopPlay(){player.pause();player.removeAttribute('src');player.load();player.hidden=true;}
+function playItem(name){
+  var url=apiPrefix()+'rec/file/'+encodeURIComponent(name);
+  player.hidden=false;player.src=url;player.load();
+  try{player.play();}catch(e){}
+  player.scrollIntoView({behavior:'smooth',block:'center'});
+}
+function render(items){
+  listNode.innerHTML='';
+  if(!items.length){setStatus('暂无录像文件');return;}
+  setStatus('共 '+items.length+' 段录像（按时间倒序）');
+  items.forEach(function(item){
+    var li=document.createElement('li');
+    var meta=document.createElement('div');meta.className='meta';
+    var t=document.createElement('div');t.className='t';t.textContent=formatTime(item.time);
+    var badge=document.createElement('span');badge.className='badge '+(item.local?'local':'nas');
+    badge.textContent=item.local?'本机':'NAS';
+    t.appendChild(badge);
+    var s=document.createElement('div');s.className='s';s.textContent=formatSize(item.size)+' · '+item.name;
+    meta.appendChild(t);meta.appendChild(s);
+    var act=document.createElement('div');act.className='act';
+    var playBtn=document.createElement('button');playBtn.textContent='播放';
+    playBtn.addEventListener('click',function(){playItem(item.name);});
+    var dl=document.createElement('a');dl.textContent='下载';dl.href=apiPrefix()+'rec/file/'+encodeURIComponent(item.name)+'?download=1';
+    dl.setAttribute('download',item.name);
+    act.appendChild(playBtn);act.appendChild(dl);
+    li.appendChild(meta);li.appendChild(act);
+    listNode.appendChild(li);
+  });
+}
+function loadList(){
+  stopPlay();setStatus('加载中…');
+  fetch(apiPrefix()+'rec/list',{cache:'no-store'}).then(function(resp){
+    if(resp.status===404){setStatus('密码错误或录像服务不可用');render([]);return null;}
+    if(!resp.ok){setStatus('加载失败：'+resp.status);return null;}
+    return resp.json();
+  }).then(function(items){if(items)render(items);}).catch(function(err){setStatus('加载失败：'+err.message);});
+}
+document.getElementById('load').addEventListener('click',function(){
+  try{localStorage.setItem('recPassword',passwordInput.value);}catch(e){}
+  loadList();
+});
+document.getElementById('refresh').addEventListener('click',loadList);
+document.getElementById('live').addEventListener('click',function(){window.location.href='/';});
+passwordInput.addEventListener('keydown',function(e){if(e.key==='Enter'){document.getElementById('load').click();}});
+try{var saved=localStorage.getItem('recPassword');if(saved!==null)passwordInput.value=saved;}catch(e){}
+loadList();
 </script>
 </body>
 </html>

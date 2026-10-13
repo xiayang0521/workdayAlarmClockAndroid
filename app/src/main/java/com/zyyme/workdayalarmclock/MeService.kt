@@ -29,6 +29,10 @@ import com.zyyme.workdayalarmclock.applist.AppListActivity
 import com.zyyme.workdayalarmclock.camera.AmbientBrightnessController
 import com.zyyme.workdayalarmclock.camera.FramebufferFrameRenderer
 import com.zyyme.workdayalarmclock.camera.CameraHttpServer
+import com.zyyme.workdayalarmclock.record.CameraRecorder
+import com.zyyme.workdayalarmclock.record.RecordConfig
+import com.zyyme.workdayalarmclock.record.RecordingAccess
+import com.zyyme.workdayalarmclock.record.RecordingUploadManager
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -142,6 +146,8 @@ class MeService : Service() {
     private var wakePendingIntent: PendingIntent? = null
     private var udpServerSocket: DatagramSocket? = null
     private var cameraHttpServer: CameraHttpServer? = null
+    private var recordUploadManager: RecordingUploadManager? = null
+    private var cameraRecorder: CameraRecorder? = null
     @Volatile private var framebufferStreaming = false
     @Volatile private var screenOffWhenStreamStop = false
     private lateinit var ambientBrightness: AmbientBrightnessController
@@ -213,6 +219,11 @@ class MeService : Service() {
         ambientBrightness = AmbientBrightnessController(this) { message ->
             print2LogView(message)
         }
+        recordUploadManager = RecordingUploadManager(
+            this,
+            File(filesDir, "recordings"),
+            { message -> print2LogView(message) }
+        ).also { it.start() }
     }
 
 
@@ -536,9 +547,14 @@ class MeService : Service() {
         }
 
         updateForegroundServiceType(cameraFeaturesEnabled(), microphoneFeaturesEnabled())
-        if (!speakerConfigured && !MeSettings.isEnabled(this, MeSettings.KEY_CAMERA_SERVER)) {
+        val recordWanted = recorderWantedBySettings()
+        if (!speakerConfigured &&
+            !MeSettings.isEnabled(this, MeSettings.KEY_CAMERA_SERVER) &&
+            !recordWanted
+        ) {
             cameraHttpServer?.stop()
             cameraHttpServer = null
+            syncRecorder(null)
             return
         }
 
@@ -559,7 +575,50 @@ class MeService : Service() {
                 }
             }
         ).also { cameraHttpServer = it }
+        server.setRecordingAccess(recordUploadManager)
         server.start(MeSettings.getCameraPassword(this))
+        syncRecorder(if (recordWanted) server else null)
+    }
+
+    private fun recorderWantedBySettings(): Boolean {
+        return MeSettings.isRecordEnabled(this) &&
+            MeSettings.isRecordConfigured(this) &&
+            hasCameraPermission()
+    }
+
+    @Synchronized
+    private fun syncRecorder(server: CameraHttpServer?) {
+        val wantedConfig = if (server == null) {
+            null
+        } else {
+            val withAudio = MeSettings.isRecordAudioEnabled(this) && hasAudioPermission()
+            RecordConfig(
+                cameraIndex = MeSettings.getRecordCameraIndex(this),
+                targetHeight = MeSettings.getRecordHeight(this),
+                withAudio = withAudio
+            )
+        }
+        val current = cameraRecorder
+        if (wantedConfig == null) {
+            current?.stop()
+            cameraRecorder = null
+            return
+        }
+        if (current != null && current.matches(wantedConfig)) return
+        current?.stop()
+        val outputDir = File(filesDir, "recordings")
+        val uploadManager = recordUploadManager
+        val recorder = CameraRecorder(
+            serverProvider = { cameraHttpServer },
+            config = wantedConfig,
+            outputDir = outputDir,
+            onSegmentReady = { segment -> uploadManager?.enqueue(segment) },
+            log = { message -> print2LogView(message) }
+        )
+        cameraRecorder = recorder
+        if (!recorder.start()) {
+            cameraRecorder = null
+        }
     }
 
     fun syncAmbientBrightnessSetting() {
@@ -656,11 +715,14 @@ class MeService : Service() {
 
     private fun cameraFeaturesEnabled(): Boolean {
         return (MeSettings.isEnabled(this, MeSettings.KEY_CAMERA_SERVER) ||
-            MeSettings.isEnabled(this, MeSettings.KEY_CAMERA_AUTO_BRIGHTNESS)) && hasCameraPermission()
+            MeSettings.isEnabled(this, MeSettings.KEY_CAMERA_AUTO_BRIGHTNESS) ||
+            recorderWantedBySettings()) && hasCameraPermission()
     }
 
     private fun microphoneFeaturesEnabled(): Boolean {
-        return MeSettings.isEnabled(this, MeSettings.KEY_CAMERA_SERVER) && hasAudioPermission()
+        val serverMic = MeSettings.isEnabled(this, MeSettings.KEY_CAMERA_SERVER)
+        val recordMic = recorderWantedBySettings() && MeSettings.isRecordAudioEnabled(this)
+        return (serverMic || recordMic) && hasAudioPermission()
     }
 
     fun updateCameraPassword() {
@@ -703,6 +765,10 @@ class MeService : Service() {
     override fun onDestroy() {
         stopMediaTrackLongPress()
         stopMediaPlayLongPress()
+        cameraRecorder?.stop()
+        cameraRecorder = null
+        recordUploadManager?.stop()
+        recordUploadManager = null
         cameraHttpServer?.stop()
         cameraHttpServer = null
         if (::ambientBrightness.isInitialized) {

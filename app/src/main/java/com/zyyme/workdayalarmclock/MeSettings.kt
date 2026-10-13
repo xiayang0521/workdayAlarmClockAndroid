@@ -43,6 +43,18 @@ object MeSettings {
     const val KEY_CAMERA_AUTO_WAKE_LEVEL = "camera_auto_wake_level"
     const val KEY_CAMERA_BRIGHTNESS_INTERVAL = "camera_brightness_interval"
     const val KEY_CAMERA_FACE_WAKE = "camera_face_wake"
+    const val KEY_RECORD_ENABLED = "record_enabled"
+    const val KEY_RECORD_CAMERA_INDEX = "record_camera_index"
+    const val KEY_RECORD_HEIGHT = "record_height"
+    const val KEY_RECORD_AUDIO = "record_audio"
+    const val KEY_WEBDAV_URL = "webdav_url"
+    const val KEY_WEBDAV_USERNAME = "webdav_username"
+    const val KEY_WEBDAV_PASSWORD = "webdav_password"
+    const val KEY_WEBDAV_DIR = "webdav_dir"
+    const val KEY_QUOTA_MODE = "quota_mode"
+    const val KEY_QUOTA_RESERVE_MB = "quota_reserve_mb"
+    const val KEY_QUOTA_LIMIT_MB = "quota_limit_mb"
+    const val KEY_LOCAL_CACHE_MB = "local_cache_mb"
     const val KEY_DESK_MASK = "desk_mask"
     const val KEY_DESK_LIGHT_TEXT = "desk_light_text"
     const val KEY_DESK_KEEP_SCREEN_ON = "desk_keep_screen_on"
@@ -175,5 +187,116 @@ object MeSettings {
             editor.putString(KEY_CAMERA_PASSWORD, cleanPassword)
         }
         editor.apply()
+    }
+
+    const val QUOTA_MODE_RESERVE = 0
+    const val QUOTA_MODE_LIMIT = 1
+
+    const val RECORD_HEIGHT_720 = 720
+    const val RECORD_HEIGHT_1080 = 1080
+
+    const val DEFAULT_QUOTA_RESERVE_MB = 1024
+    const val DEFAULT_QUOTA_LIMIT_MB = 10240
+    const val DEFAULT_LOCAL_CACHE_MB = 512
+
+    fun isRecordEnabled(context: Context): Boolean {
+        return isEnabled(context, KEY_RECORD_ENABLED)
+    }
+
+    fun setRecordEnabled(context: Context, enabled: Boolean) {
+        setEnabled(context, KEY_RECORD_ENABLED, enabled)
+    }
+
+    fun getRecordCameraIndex(context: Context): Int {
+        return getInt(context, KEY_RECORD_CAMERA_INDEX, 0)
+    }
+
+    fun setRecordCameraIndex(context: Context, index: Int) {
+        setInt(context, KEY_RECORD_CAMERA_INDEX, index)
+    }
+
+    fun getRecordHeight(context: Context): Int {
+        return getInt(context, KEY_RECORD_HEIGHT, RECORD_HEIGHT_1080)
+    }
+
+    fun setRecordHeight(context: Context, height: Int) {
+        setInt(context, KEY_RECORD_HEIGHT, height)
+    }
+
+    fun isRecordAudioEnabled(context: Context): Boolean {
+        return isEnabled(context, KEY_RECORD_AUDIO, true)
+    }
+
+    fun setRecordAudioEnabled(context: Context, enabled: Boolean) {
+        setEnabled(context, KEY_RECORD_AUDIO, enabled)
+    }
+
+    fun getWebDavUrl(context: Context): String {
+        return getString(context, KEY_WEBDAV_URL, "").trim().trimEnd('/')
+    }
+
+    fun setWebDavUrl(context: Context, url: String) {
+        setString(context, KEY_WEBDAV_URL, url.trim().trimEnd('/'))
+    }
+
+    fun getWebDavUsername(context: Context): String {
+        return getString(context, KEY_WEBDAV_USERNAME, "").trim()
+    }
+
+    fun setWebDavUsername(context: Context, username: String) {
+        setString(context, KEY_WEBDAV_USERNAME, username.trim())
+    }
+
+    fun getWebDavPassword(context: Context): String {
+        return getString(context, KEY_WEBDAV_PASSWORD, "")
+    }
+
+    fun setWebDavPassword(context: Context, password: String) {
+        setString(context, KEY_WEBDAV_PASSWORD, password)
+    }
+
+    fun getWebDavDir(context: Context): String {
+        val raw = getString(context, KEY_WEBDAV_DIR, "").trim().trim('/')
+        return raw
+    }
+
+    fun setWebDavDir(context: Context, dir: String) {
+        setString(context, KEY_WEBDAV_DIR, dir.trim().trim('/'))
+    }
+
+    fun getQuotaMode(context: Context): Int {
+        return getInt(context, KEY_QUOTA_MODE, QUOTA_MODE_RESERVE)
+    }
+
+    fun setQuotaMode(context: Context, mode: Int) {
+        setInt(context, KEY_QUOTA_MODE, mode)
+    }
+
+    fun getQuotaReserveMb(context: Context): Int {
+        return getInt(context, KEY_QUOTA_RESERVE_MB, DEFAULT_QUOTA_RESERVE_MB)
+    }
+
+    fun setQuotaReserveMb(context: Context, mb: Int) {
+        setInt(context, KEY_QUOTA_RESERVE_MB, mb)
+    }
+
+    fun getQuotaLimitMb(context: Context): Int {
+        return getInt(context, KEY_QUOTA_LIMIT_MB, DEFAULT_QUOTA_LIMIT_MB)
+    }
+
+    fun setQuotaLimitMb(context: Context, mb: Int) {
+        setInt(context, KEY_QUOTA_LIMIT_MB, mb)
+    }
+
+    fun getLocalCacheMb(context: Context): Int {
+        return getInt(context, KEY_LOCAL_CACHE_MB, DEFAULT_LOCAL_CACHE_MB)
+    }
+
+    fun setLocalCacheMb(context: Context, mb: Int) {
+        setInt(context, KEY_LOCAL_CACHE_MB, mb)
+    }
+
+    fun isRecordConfigured(context: Context): Boolean {
+        return getWebDavUrl(context).isNotEmpty()
     }
 }

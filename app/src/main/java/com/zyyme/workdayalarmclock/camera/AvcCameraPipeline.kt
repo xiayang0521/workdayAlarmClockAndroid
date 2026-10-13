@@ -201,9 +201,11 @@ internal class AvcCameraPipeline(
         if (usableSizes.isEmpty()) return null
 
         val resolutionIndex = key.resolutionIndex
-        val chosenSize = if (resolutionIndex != null) {
-            sortedSizes(usableSizes).getOrNull(resolutionIndex) ?: return null
-        } else {
+        val targetHeight = key.targetHeight
+        val chosenSize = when {
+            targetHeight != null -> selectSizeByTargetHeight(usableSizes, targetHeight)
+            resolutionIndex != null -> sortedSizes(usableSizes).getOrNull(resolutionIndex) ?: return null
+            else -> {
             val preferredSizes = usableSizes.filter { size ->
                 if (size.width > MAX_PREFERRED_WIDTH) return@filter false
                 if (targetAeRange == null) return@filter false
@@ -226,6 +228,7 @@ internal class AvcCameraPipeline(
                 cameraSupportsTarget && encoderSupportsTarget
             }
             largestSize(if (preferredSizes.isNotEmpty()) preferredSizes else usableSizes)
+            }
         }
 
         val cameraDuration = try {
@@ -285,6 +288,21 @@ internal class AvcCameraPipeline(
             compareByDescending<Size> { it.width.toLong() * it.height }
                 .thenByDescending { it.width }
         )
+    }
+
+    private fun selectSizeByTargetHeight(sizes: List<Size>, targetHeight: Int): Size {
+        fun Size.shorterEdge() = min(width, height)
+        val meeting = sizes.filter { it.shorterEdge() >= targetHeight }
+        if (meeting.isNotEmpty()) {
+            return meeting.minWithOrNull(
+                compareBy<Size> { it.shorterEdge() }
+                    .thenBy { it.width.toLong() * it.height }
+            )!!
+        }
+        return sizes.maxWithOrNull(
+            compareBy<Size> { it.shorterEdge() }
+                .thenBy { it.width.toLong() * it.height }
+        )!!
     }
 
     private fun selectFpsRange(ranges: List<Range<Int>>, targetFps: Int): Range<Int>? {
