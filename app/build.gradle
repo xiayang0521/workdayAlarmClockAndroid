@@ -12,7 +12,7 @@ android {
         minSdk 14
         targetSdk 32
         versionCode 158
-        versionName "42.1"
+        versionName "41.0-camera-record"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
