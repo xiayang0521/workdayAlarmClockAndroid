@@ -11,6 +11,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -24,6 +25,7 @@ import android.util.TypedValue
 import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.SurfaceHolder
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
@@ -72,6 +74,7 @@ class ClockActivity : AppCompatActivity() {
     private var showMsgUntil = 0L
 
     var clockMode = false
+    private var enterClockModeAfterLayout = false
 
     private var returnPackage: String? = null
 
@@ -84,6 +87,10 @@ class ClockActivity : AppCompatActivity() {
     private var isUserSeeking = false
 
     private lateinit var wallpaperView: ImageView
+    private lateinit var wallpaperVideoView: CenterCropVideoSurfaceView
+    private var wallpaperPlayer: MediaPlayer? = null
+    private var wallpaperSurfaceReady = false
+    private var videoWallpaperFile: File? = null
     private lateinit var wallpaperMaskView: View
     private var wallpaperBitmap: Bitmap? = null
     private var framebufferOverlay: ImageView? = null
@@ -117,6 +124,11 @@ class ClockActivity : AppCompatActivity() {
 
         super.onCreate(savedInstanceState)
         returnPackage = intent.getStringExtra(HomeLauncherActivity.EXTRA_RETURN_PACKAGE)
+        enterClockModeAfterLayout = (lastCustomNonConfigurationInstance as? Boolean)
+            ?: (
+            intent.getBooleanExtra("clockMode", false) ||
+                    intent.action == "android.media.action.STILL_IMAGE_CAMERA"
+            )
 
         // 启动Go服务 如果App以特殊方式启动
         if (MeService.me == null) {
@@ -159,6 +171,20 @@ class ClockActivity : AppCompatActivity() {
 
         wallpaperView = findViewById(R.id.clock_wallpaper)
         wallpaperMaskView = findViewById(R.id.clock_wallpaper_mask)
+        wallpaperVideoView = findViewById(R.id.clock_wallpaper_video)
+        wallpaperVideoView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                wallpaperSurfaceReady = true
+                startVideoWallpaper()
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                wallpaperSurfaceReady = false
+                releaseWallpaperPlayer()
+            }
+        })
         val tvTop = findViewById<TextView>(R.id.tv_top)
         val tvTime = findViewById<TextView>(R.id.tv_time)
         val tvDate = findViewById<TextView>(R.id.tv_date)
@@ -320,7 +346,7 @@ class ClockActivity : AppCompatActivity() {
 
         tvDate.setOnClickListener {
             if (clockMode) {
-                recreate()
+                exitFullScreenClock()
             } else {
                 // 切换暗色模式
                 if (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES) {
@@ -364,12 +390,11 @@ class ClockActivity : AppCompatActivity() {
         val rootLayout = findViewById<LinearLayout>(R.id.root_layout)
         rootLayout.post {
             // 延迟进行字体大小调整  初始化完后延时执行
-            if (intent.getBooleanExtra("clockMode", false) ||
-                intent.action == "android.media.action.STILL_IMAGE_CAMERA"
-            ) {
+            if (enterClockModeAfterLayout) {
                 Log.d("intent", "收到clockMode")
                 // 直接进入全屏时钟模式
                 setFullScreenClock()
+                enterClockModeAfterLayout = false
             }
             // 保持亮屏flag
             if (intent.getBooleanExtra("keepOn", false)) {
@@ -379,6 +404,11 @@ class ClockActivity : AppCompatActivity() {
             }
             // 清空
             intent.replaceExtras(Intent())
+
+            // 计算一下实际的宽和高存起来
+            val content = findViewById<View>(R.id.root_layout)
+            MeService.me?.fbinfoX = content.width
+            MeService.me?.fbinfoY = content.height
         }
 
 
@@ -448,11 +478,17 @@ class ClockActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         isActivityStarted = true
+        startVideoWallpaper()
         FramebufferFrameRenderer.requestLatestFrame()
+    }
+
+    override fun onRetainCustomNonConfigurationInstance(): Any {
+        return clockMode || enterClockModeAfterLayout
     }
 
     override fun onStop() {
         isActivityStarted = false
+        releaseWallpaperPlayer()
         super.onStop()
     }
 
@@ -473,7 +509,7 @@ class ClockActivity : AppCompatActivity() {
     override fun onBackPressed() {
         // 收起的时候按一下回到收起前状态
         if (clockMode) {
-            recreate()
+            exitFullScreenClock()
             return
         }
 
@@ -491,6 +527,12 @@ class ClockActivity : AppCompatActivity() {
         } else {
             super.onBackPressed()
         }
+    }
+
+    private fun exitFullScreenClock() {
+        clockMode = false
+        enterClockModeAfterLayout = false
+        recreate()
     }
 
     private fun setFullScreenClock() {
@@ -606,7 +648,7 @@ class ClockActivity : AppCompatActivity() {
 
     private fun isAutoWallpaperFile(file: File): Boolean {
         return when (file.extension.lowercase(Locale.ROOT)) {
-            "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif" -> true
+            "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "mp4" -> true
             else -> false
         }
     }
@@ -667,12 +709,26 @@ class ClockActivity : AppCompatActivity() {
     }
 
     private fun loadClockWallpaper() {
+        if (isFinishing || !clockMode) return
+        hideClockWallpaper()
+        val auto = selectAutoWallpaper()
+        val savedVideo = File(filesDir, "desk.mp4")
+        val selected = auto ?: savedVideo.takeIf { it.isFile } ?: File(filesDir, "desk.jpg")
+        if (selected.extension.equals("mp4", ignoreCase = true)) {
+            videoWallpaperFile = selected
+            wallpaperVideoView.visibility = if (FramebufferFrameRenderer.isStreaming()) View.GONE else View.VISIBLE
+            wallpaperMaskView.visibility = View.VISIBLE
+            startVideoWallpaper()
+            return
+        }
+        loadImageWallpaper(selected, auto != null)
+    }
+
+    private fun loadImageWallpaper(selected: File, fallbackToSaved: Boolean) {
         val width = wallpaperView.width.coerceAtLeast(resources.displayMetrics.widthPixels)
         val height = wallpaperView.height.coerceAtLeast(resources.displayMetrics.heightPixels)
-        val auto = selectAutoWallpaper()
-        val selected = auto ?: File(filesDir, "desk.jpg")
         val bitmap = decodeSampledFileSafely(selected, width, height)
-            ?: if (auto != null) {
+            ?: if (fallbackToSaved) {
                 decodeSampledFileSafely(File(filesDir, "desk.jpg"), width, height)
             } else {
                 null
@@ -692,11 +748,80 @@ class ClockActivity : AppCompatActivity() {
     }
 
     private fun hideClockWallpaper() {
+        releaseWallpaperPlayer()
+        videoWallpaperFile = null
+        wallpaperVideoView.visibility = View.GONE
         wallpaperView.visibility = View.GONE
         wallpaperMaskView.visibility = View.GONE
         wallpaperView.setImageDrawable(null)
         wallpaperBitmap?.let { if (!it.isRecycled) it.recycle() }
         wallpaperBitmap = null
+    }
+
+    private fun startVideoWallpaper() {
+        val file = videoWallpaperFile ?: return
+        if (!clockMode || !isActivityStarted || isFinishing || FramebufferFrameRenderer.isStreaming()) return
+        wallpaperVideoView.visibility = View.VISIBLE
+        if (!wallpaperSurfaceReady || wallpaperPlayer != null) return
+        try {
+            val player = MediaPlayer()
+            wallpaperPlayer = player
+            player.setDisplay(wallpaperVideoView.holder)
+            player.setVolume(0f, 0f)
+            player.setOnVideoSizeChangedListener { _, width, height ->
+                updateVideoWallpaperSize(width, height)
+            }
+            player.setOnPreparedListener {
+                if (wallpaperPlayer === it && clockMode && isActivityStarted) {
+                    it.setVolume(0f, 0f)
+                    updateVideoWallpaperSize(it.videoWidth, it.videoHeight)
+                    it.start()
+                }
+            }
+            player.setOnCompletionListener { it.seekTo(0) }
+            player.setOnSeekCompleteListener {
+                if (wallpaperPlayer === it && clockMode && isActivityStarted) it.start()
+            }
+            player.setOnErrorListener { _, _, _ ->
+                onVideoWallpaperFailed()
+                true
+            }
+            player.setDataSource(file.absolutePath)
+            player.prepareAsync()
+        } catch (_: Exception) {
+            onVideoWallpaperFailed()
+        }
+    }
+
+    private fun updateVideoWallpaperSize(videoWidth: Int, videoHeight: Int) {
+        wallpaperVideoView.setVideoSize(videoWidth, videoHeight)
+    }
+
+    private fun onVideoWallpaperFailed() {
+        hideClockWallpaper()
+        loadImageWallpaper(File(filesDir, "desk.jpg"), false)
+        showMsg("视频壁纸播放失败")
+    }
+
+    private fun releaseWallpaperPlayer() {
+        wallpaperPlayer?.apply {
+            setOnPreparedListener(null)
+            setOnCompletionListener(null)
+            setOnSeekCompleteListener(null)
+            setOnErrorListener(null)
+            setOnVideoSizeChangedListener(null)
+            release()
+        }
+        wallpaperPlayer = null
+    }
+
+    internal fun setFramebufferStreaming(active: Boolean) {
+        if (active) {
+            releaseWallpaperPlayer()
+            wallpaperVideoView.visibility = View.GONE
+        } else {
+            startVideoWallpaper()
+        }
     }
 
     internal fun showFramebufferFrame(bitmap: Bitmap): Bitmap? {
@@ -858,6 +983,7 @@ class ClockActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        isActivityStarted = false
 //        mediaButtonReceiverDestroy()
         // 时间计时器回收
         timeHandler.removeCallbacks(hourlyWallpaperRunnable)

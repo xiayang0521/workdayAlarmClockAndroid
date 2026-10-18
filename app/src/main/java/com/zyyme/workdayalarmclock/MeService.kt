@@ -183,6 +183,11 @@ class MeService : Service() {
     @Volatile private var lyricLines = emptyList<LyricLine>()
     @Volatile private var lyricVersion = 0
     @Volatile private var hasPendingSongId = false
+
+    // 存一下真实的屏幕尺寸，给fbinfo用
+    var fbinfoX = 0
+    var fbinfoY = 0
+
     private val playbackCheckpointRunnable = object : Runnable {
         override fun run() {
             if (playerState == PlayerState.PLAYING || playerState == PlayerState.BUFFERING) {
@@ -1726,8 +1731,9 @@ class MeService : Service() {
             }
             if (resumeAfterAudioFocusGain) {
                 requestResumePlayback()
-                scheduleAutoBackToClock()
             }
+            // 无论之前是否在播放，重新获得焦点后都要安排自动回到时钟
+            scheduleAutoBackToClock()
         }
     }
 

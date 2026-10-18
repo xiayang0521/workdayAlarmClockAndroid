@@ -13,6 +13,7 @@ import android.graphics.Color
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.LayerDrawable
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -20,6 +21,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.text.Editable
 import android.text.TextWatcher
 import android.text.method.ScrollingMovementMethod
@@ -27,6 +29,7 @@ import android.view.GestureDetector
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.SurfaceHolder
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
@@ -101,6 +104,10 @@ class DeskActivity : AppCompatActivity() {
     private val baseIconDrawables = mutableMapOf<Int, Drawable>()
 
     private lateinit var wallpaperView: ImageView
+    private lateinit var wallpaperVideoView: CenterCropVideoSurfaceView
+    private var wallpaperPlayer: MediaPlayer? = null
+    private var wallpaperSurfaceReady = false
+    private var videoWallpaperFile: File? = null
     private lateinit var framebufferOverlay: ImageView
     private lateinit var overlayContainer: View
     private lateinit var maskView: View
@@ -258,6 +265,11 @@ class DeskActivity : AppCompatActivity() {
             applyConfiguredLayout()
             loadWallpaper()
             handleIntent(intent)
+
+            // 计算一下实际的宽和高存起来
+            val content = findViewById<View>(android.R.id.content)
+            MeService.me?.fbinfoX = content.width
+            MeService.me?.fbinfoY = content.height
         }
         handler.post(nonLyricsRefreshRunnable)
         scheduleHourlyUpdates()
@@ -276,12 +288,14 @@ class DeskActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         isActivityStarted = true
+        startVideoWallpaper()
         setFramebufferStreaming(FramebufferFrameRenderer.isStreaming())
         FramebufferFrameRenderer.requestLatestFrame()
     }
 
     override fun onStop() {
         isActivityStarted = false
+        releaseWallpaperPlayer()
         super.onStop()
     }
 
@@ -325,6 +339,20 @@ class DeskActivity : AppCompatActivity() {
 
     private fun bindViews() {
         wallpaperView = findViewById(R.id.desk_wallpaper)
+        wallpaperVideoView = findViewById(R.id.desk_wallpaper_video)
+        wallpaperVideoView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                wallpaperSurfaceReady = true
+                startVideoWallpaper()
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                wallpaperSurfaceReady = false
+                releaseWallpaperPlayer()
+            }
+        })
         framebufferOverlay = findViewById(R.id.desk_framebuffer)
         overlayContainer = findViewById(R.id.desk_overlay_container)
         maskView = findViewById(R.id.desk_mask)
@@ -764,7 +792,7 @@ class DeskActivity : AppCompatActivity() {
     }
 
     private fun chooseWallpaper() {
-        Toast.makeText(this, "将图片放到内置存储的zyymeWallpaper中可每小时随机轮换", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "将图片或MP4视频放到内置存储的zyymeWallpaper中可每小时随机轮换", Toast.LENGTH_LONG).show()
         val action = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
             Intent.ACTION_OPEN_DOCUMENT
         } else {
@@ -774,7 +802,10 @@ class DeskActivity : AppCompatActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
                 addCategory(Intent.CATEGORY_OPENABLE)
             }
-            type = "image/*"
+            type = "*/*"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/mp4"))
+            }
         }
         startActivityForResult(intent, REQUEST_PICK_WALLPAPER)
     }
@@ -784,7 +815,17 @@ class DeskActivity : AppCompatActivity() {
         if (requestCode == REQUEST_PICK_WALLPAPER && resultCode == Activity.RESULT_OK) {
             val source = data?.data ?: return
             pendingWallpaperUri = source
-            tryCropWallpaper(source)
+            if (isMp4Wallpaper(source)) {
+                saveWallpaperUri(source, isVideo = true)
+            } else {
+                val mimeType = contentResolver.getType(source)
+                if (mimeType?.startsWith("video/") == true) {
+                    Toast.makeText(this, "视频壁纸仅支持MP4格式", Toast.LENGTH_LONG).show()
+                    pendingWallpaperUri = null
+                    return
+                }
+                tryCropWallpaper(source)
+            }
         } else if (requestCode == REQUEST_CROP_WALLPAPER && resultCode == Activity.RESULT_OK) {
             val cropped = File(cacheDir, "desk_crop.jpg")
             if (cropped.exists() && cropped.length() > 0L) {
@@ -829,15 +870,30 @@ class DeskActivity : AppCompatActivity() {
         }
     }
 
-    private fun saveWallpaperUri(source: Uri) {
+    private fun isMp4Wallpaper(source: Uri): Boolean {
+        if (contentResolver.getType(source).equals("video/mp4", ignoreCase = true)) return true
+        val displayName = try {
+            contentResolver.query(source, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                if (it.moveToFirst()) it.getString(0) else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+        return (displayName ?: source.lastPathSegment).orEmpty().endsWith(".mp4", ignoreCase = true)
+    }
+
+    private fun saveWallpaperUri(source: Uri, isVideo: Boolean = false) {
         Thread {
             try {
-                val target = File(filesDir, "desk.jpg")
+                val target = File(filesDir, if (isVideo) "desk.mp4" else "desk.jpg")
+                val temporary = File(filesDir, "${target.name}.tmp")
                 val input = contentResolver.openInputStream(source)
-                    ?: throw IllegalStateException("无法读取选择的图片")
+                    ?: throw IllegalStateException("无法读取选择的壁纸")
                 input.use {
-                    FileOutputStream(target).use { output -> input.copyTo(output) }
+                    FileOutputStream(temporary).use { output -> input.copyTo(output) }
                 }
+                check(temporary.renameTo(target)) { "无法保存壁纸" }
+                File(filesDir, if (isVideo) "desk.jpg" else "desk.mp4").delete()
                 handler.post { onWallpaperSaved() }
             } catch (e: Exception) {
                 handler.post { Toast.makeText(this, "壁纸设置失败：${e.message}", Toast.LENGTH_LONG).show() }
@@ -852,6 +908,7 @@ class DeskActivity : AppCompatActivity() {
                 source.inputStream().use { input ->
                     FileOutputStream(target).use { output -> input.copyTo(output) }
                 }
+                File(filesDir, "desk.mp4").delete()
                 handler.post { onWallpaperSaved() }
             } catch (e: Exception) {
                 handler.post { Toast.makeText(this, "壁纸设置失败：${e.message}", Toast.LENGTH_LONG).show() }
@@ -902,7 +959,7 @@ class DeskActivity : AppCompatActivity() {
 
     private fun isAutoWallpaperFile(file: File): Boolean {
         return when (file.extension.lowercase(Locale.ROOT)) {
-            "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif" -> true
+            "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "mp4" -> true
             else -> false
         }
     }
@@ -963,13 +1020,31 @@ class DeskActivity : AppCompatActivity() {
     }
 
     private fun loadWallpaper() {
+        releaseWallpaperPlayer()
+        videoWallpaperFile = null
+        wallpaperVideoView.visibility = View.GONE
+        wallpaperView.visibility = View.VISIBLE
+        val auto = selectAutoWallpaper()
+        val savedVideo = File(filesDir, "desk.mp4")
+        val custom = auto ?: savedVideo.takeIf { it.isFile } ?: File(filesDir, "desk.jpg")
+        if (custom.extension.equals("mp4", ignoreCase = true)) {
+            videoWallpaperFile = custom
+            wallpaperView.setImageDrawable(null)
+            wallpaperBitmap?.let { if (!it.isRecycled) it.recycle() }
+            wallpaperBitmap = null
+            wallpaperVideoView.visibility = if (FramebufferFrameRenderer.isStreaming()) View.GONE else View.VISIBLE
+            startVideoWallpaper()
+            return
+        }
+        loadImageWallpaper(custom, auto != null)
+    }
+
+    private fun loadImageWallpaper(custom: File, fallbackToSaved: Boolean) {
         val width = wallpaperView.width.coerceAtLeast(resources.displayMetrics.widthPixels)
         val height = wallpaperView.height.coerceAtLeast(resources.displayMetrics.heightPixels)
-        val auto = selectAutoWallpaper()
-        val custom = auto ?: File(filesDir, "desk.jpg")
         try {
             val bitmap = decodeSampledFileSafely(custom, width, height)
-                ?: if (auto != null) {
+                ?: if (fallbackToSaved) {
                     decodeSampledFileSafely(File(filesDir, "desk.jpg"), width, height)
                 } else {
                     null
@@ -984,6 +1059,66 @@ class DeskActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Toast.makeText(this, "壁纸读取失败：${e.message}", Toast.LENGTH_LONG).show()
         }
+    }
+
+    private fun startVideoWallpaper() {
+        val file = videoWallpaperFile ?: return
+        if (!isActivityStarted || isFinishing || FramebufferFrameRenderer.isStreaming()) return
+        wallpaperVideoView.visibility = View.VISIBLE
+        if (!wallpaperSurfaceReady || wallpaperPlayer != null) return
+        try {
+            val player = MediaPlayer()
+            wallpaperPlayer = player
+            player.setDisplay(wallpaperVideoView.holder)
+            player.setVolume(0f, 0f)
+            player.setOnVideoSizeChangedListener { _, width, height ->
+                updateVideoWallpaperSize(width, height)
+            }
+            player.setOnPreparedListener {
+                if (wallpaperPlayer === it && isActivityStarted) {
+                    it.setVolume(0f, 0f)
+                    updateVideoWallpaperSize(it.videoWidth, it.videoHeight)
+                    it.start()
+                }
+            }
+            // 按要求在结束时回到起点，seek 完成后继续播放。
+            player.setOnCompletionListener { it.seekTo(0) }
+            player.setOnSeekCompleteListener {
+                if (wallpaperPlayer === it && isActivityStarted) it.start()
+            }
+            player.setOnErrorListener { _, _, _ ->
+                onVideoWallpaperFailed()
+                true
+            }
+            player.setDataSource(file.absolutePath)
+            player.prepareAsync()
+        } catch (_: Exception) {
+            onVideoWallpaperFailed()
+        }
+    }
+
+    private fun updateVideoWallpaperSize(videoWidth: Int, videoHeight: Int) {
+        wallpaperVideoView.setVideoSize(videoWidth, videoHeight)
+    }
+
+    private fun onVideoWallpaperFailed() {
+        releaseWallpaperPlayer()
+        videoWallpaperFile = null
+        wallpaperVideoView.visibility = View.GONE
+        loadImageWallpaper(File(filesDir, "desk.jpg"), false)
+        Toast.makeText(this, "视频壁纸播放失败", Toast.LENGTH_LONG).show()
+    }
+
+    private fun releaseWallpaperPlayer() {
+        wallpaperPlayer?.apply {
+            setOnPreparedListener(null)
+            setOnCompletionListener(null)
+            setOnSeekCompleteListener(null)
+            setOnErrorListener(null)
+            setOnVideoSizeChangedListener(null)
+            release()
+        }
+        wallpaperPlayer = null
     }
 
     internal fun showFramebufferFrame(bitmap: Bitmap): Bitmap? {
@@ -1002,6 +1137,8 @@ class DeskActivity : AppCompatActivity() {
         framebufferStreaming = active
         handler.removeCallbacks(hideFramebufferControlsRunnable)
         if (active) {
+            releaseWallpaperPlayer()
+            wallpaperVideoView.visibility = View.GONE
             framebufferOverlay.visibility = View.VISIBLE
             if (alarmMode) {
                 overlayContainer.visibility = View.VISIBLE
@@ -1010,6 +1147,7 @@ class DeskActivity : AppCompatActivity() {
             }
         } else {
             overlayContainer.visibility = View.VISIBLE
+            startVideoWallpaper()
         }
     }
 
@@ -1401,6 +1539,8 @@ class DeskActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        isActivityStarted = false
+        releaseWallpaperPlayer()
         window.decorView.removeCallbacks(fullscreenRestoreRunnable)
         resetConfirmKeyLongPress()
         handler.removeCallbacks(refreshRunnable)

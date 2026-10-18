@@ -1,6 +1,7 @@
 package com.zyyme.workdayalarmclock.camera
 
 import android.Manifest
+import android.R
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
@@ -20,6 +21,7 @@ import android.util.Log
 import android.util.DisplayMetrics
 import android.graphics.Point
 import android.view.Surface
+import android.view.View
 import android.view.WindowManager
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -32,7 +34,9 @@ import com.zyyme.workdayalarmclock.record.RecordingAccess
 import com.zyyme.workdayalarmclock.nas.WebDavClient
 import com.zyyme.workdayalarmclock.record.FsUsbRecordStore
 import com.zyyme.workdayalarmclock.record.UsbRecordTargets
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.EOFException
 import java.io.File
 import java.io.InputStream
 import java.io.InputStreamReader
@@ -86,6 +90,7 @@ internal class CameraHttpServer(
     private var recordingVideoToken: CameraStreamToken? = null
     private var recordingAudio = false
     private val framebufferStreamActive = AtomicBoolean(false)
+    private val framebufferSessionLock = Any()
     @Volatile private var password = ""
     @Volatile private var lanDomain: String = ""
     @Volatile private var lanIp: String = ""
@@ -189,9 +194,14 @@ internal class CameraHttpServer(
         } catch (_: Exception) {
         }
         serverSocket = null
-        try {
-            activeFramebufferSocket?.close()
-        } catch (_: Exception) {
+        synchronized(framebufferSessionLock) {
+            val socket = activeFramebufferSocket
+            activeFramebufferSocket = null
+            try {
+                socket?.close()
+            } catch (_: Exception) {
+            }
+            if (socket != null) framebufferStreamState(false)
         }
         closeActiveSession()
         closeActiveAudioSession()
@@ -405,17 +415,19 @@ internal class CameraHttpServer(
     }
 
     private fun writeFramebufferInfo(socket: Socket) {
-        val displaySize = activeActivityDisplaySize()
         val metrics = DisplayMetrics()
-        if (displaySize == null) {
+        var width = MeService.me?.fbinfoX ?: 0
+        var height = MeService.me?.fbinfoY ?: 0
+        if (MeService.me == null || MeService.me!!.fbinfoX == 0 || MeService.me!!.fbinfoY == 0) {
+            // 在正常情况下永远不可能走到这里
             val windowManager = appContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             windowManager.defaultDisplay.getMetrics(metrics)
+            width = metrics.widthPixels
+            height = metrics.heightPixels
         }
-        val width = (displaySize?.x ?: metrics.widthPixels).coerceAtLeast(1)
-        val height = (displaySize?.y ?: metrics.heightPixels).coerceAtLeast(1)
         val stride = width.toLong() * 4L
         val frameSize = stride * height
-        val body = org.json.JSONObject()
+        val body = JSONObject()
             .put("device", "Android display")
             .put("width", width)
             .put("height", height)
@@ -441,27 +453,6 @@ internal class CameraHttpServer(
         writeJsonResponse(socket, 200, "OK", body)
     }
 
-    private fun activeActivityDisplaySize(): Point? {
-        val activity = ClockActivity.me?.takeIf { it.isActivityStarted }
-            ?: DeskActivity.me?.takeIf { it.isActivityStarted }
-            ?: return null
-        val content = activity.findViewById<android.view.View>(android.R.id.content)
-            ?: return null
-        if (content.width <= 0 || content.height <= 0) return null
-        val decorView = activity.window.decorView
-        val contentDrawsBehindStatusBar =
-            (decorView.systemUiVisibility and
-                (android.view.View.SYSTEM_UI_FLAG_FULLSCREEN or
-                    android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN)) != 0
-        val statusBars = WindowInsetsCompat.Type.statusBars()
-        val statusBarInset = if (contentDrawsBehindStatusBar) {
-            0
-        } else {
-            ViewCompat.getRootWindowInsets(decorView)?.getInsets(statusBars)?.top ?: 0
-        }
-        return Point(content.width, content.height + statusBarInset)
-    }
-
     private fun streamFramebuffer(socket: Socket, request: HttpRequest) {
         val boundary = parseMultipartBoundary(request.contentType)
         if (boundary == null) {
@@ -474,16 +465,22 @@ internal class CameraHttpServer(
             )
             return
         }
-        if (!framebufferStreamActive.compareAndSet(false, true)) {
-            writeEmptyResponse(socket, 503, "Service Unavailable")
-            return
-        }
-        activeFramebufferSocket = socket
-
         var frameCount = 0L
         var jpegBytes = 0L
-        var streamStarted = false
         try {
+            synchronized(framebufferSessionLock) {
+                if (!running.get()) return
+                val previous = activeFramebufferSocket
+                activeFramebufferSocket = socket
+                if (previous != null) {
+                    try {
+                        previous.close()
+                    } catch (_: Exception) {
+                    }
+                    framebufferStreamState(false)
+                }
+                framebufferStreamState(true)
+            }
             if (request.expectContinue) {
                 socket.getOutputStream().write(
                     "HTTP/1.1 100 Continue\r\n\r\n".toByteArray(HTTP_CHARSET)
@@ -491,12 +488,10 @@ internal class CameraHttpServer(
                 socket.getOutputStream().flush()
             }
             socket.soTimeout = 0
-            framebufferStreamState(true)
-            streamStarted = true
             val boundaryLine = "--$boundary"
-            while (running.get() && !socket.isClosed) {
+            while (running.get() && !socket.isClosed && activeFramebufferSocket === socket) {
                 val line = readHttpLine(request.body)
-                    ?: throw java.io.EOFException("missing MJPEG boundary")
+                    ?: throw EOFException("missing MJPEG boundary")
                 if (line == "$boundaryLine--") break
                 if (line != boundaryLine) {
                     throw IllegalArgumentException("invalid MJPEG boundary")
@@ -507,7 +502,7 @@ internal class CameraHttpServer(
                 var headerCount = 0
                 while (true) {
                     val header = readHttpLine(request.body)
-                        ?: throw java.io.EOFException("truncated MJPEG part headers")
+                        ?: throw EOFException("truncated MJPEG part headers")
                     if (header.isEmpty()) break
                     headerCount++
                     if (headerCount > 32) {
@@ -539,15 +534,19 @@ internal class CameraHttpServer(
                     var offset = 0
                     while (offset < frameLength) {
                         val count = request.body.read(jpeg, offset, frameLength - offset)
-                        if (count < 0) throw java.io.EOFException("truncated JPEG frame")
+                        if (count < 0) throw EOFException("truncated JPEG frame")
                         if (count == 0) continue
                         offset += count
                     }
                     if (readHttpLine(request.body) != "") {
                         throw IllegalArgumentException("missing MJPEG part terminator")
                     }
-                    framebufferFrame(jpeg, frameLength)
-                    frame = null
+                    synchronized(framebufferSessionLock) {
+                        // A replaced reader may still have a complete frame buffered locally.
+                        if (activeFramebufferSocket !== socket) return
+                        framebufferFrame(jpeg, frameLength)
+                        frame = null
+                    }
                 } finally {
                     frame?.let(FramebufferJpegBufferPool::release)
                 }
@@ -569,9 +568,13 @@ internal class CameraHttpServer(
                 .toByteArray(HTML_CHARSET)
             writeJsonResponse(socket, status, reason, response)
         } finally {
-            if (streamStarted) framebufferStreamState(false)
-            if (activeFramebufferSocket === socket) activeFramebufferSocket = null
-            framebufferStreamActive.set(false)
+            synchronized(framebufferSessionLock) {
+                // The old reader must not clear the replacement session's renderer state.
+                if (activeFramebufferSocket === socket) {
+                    activeFramebufferSocket = null
+                    framebufferStreamState(false)
+                }
+            }
         }
     }
 
@@ -615,7 +618,7 @@ internal class CameraHttpServer(
         override fun read(): Int {
             if (!ensureChunk()) return -1
             val value = input.read()
-            if (value < 0) throw java.io.EOFException("truncated chunk")
+            if (value < 0) throw EOFException("truncated chunk")
             remaining--
             if (remaining == 0) consumeCrlf()
             return value
@@ -625,23 +628,26 @@ internal class CameraHttpServer(
             if (length == 0) return 0
             if (!ensureChunk()) return -1
             val count = input.read(buffer, offset, minOf(length, remaining))
-            if (count < 0) throw java.io.EOFException("truncated chunk")
+            if (count < 0) throw EOFException("truncated chunk")
             if (count == 0) return 0
             remaining -= count
             if (remaining == 0) consumeCrlf()
             return count
         }
 
+        // 让上层能估算内核里还压着多少没读的音频(跳读要用)
+        override fun available(): Int = remaining + input.available()
+
         private fun ensureChunk(): Boolean {
             if (finished) return false
             if (remaining > 0) return true
-            val line = readLine() ?: throw java.io.EOFException("missing chunk header")
+            val line = readLine() ?: throw EOFException("missing chunk header")
             val sizeText = line.substringBefore(';').trim()
             remaining = sizeText.toIntOrNull(16)
                 ?: throw IllegalArgumentException("invalid chunk size: $line")
             if (remaining == 0) {
                 while (true) {
-                    val trailer = readLine() ?: throw java.io.EOFException("missing chunk trailer")
+                    val trailer = readLine() ?: throw EOFException("missing chunk trailer")
                     if (trailer.isEmpty()) break
                 }
                 finished = true
@@ -754,18 +760,20 @@ internal class CameraHttpServer(
             } else {
                 AudioFormat.CHANNEL_OUT_STEREO
             }
+            var frameBytes = rate * channels * 2 / 1000  // 每 ms 的字节数
             val minBufferFallback = AudioTrack.getMinBufferSize(
                 rate,
                 channelMask,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val minBuffer = minBufferFallback / 2
+            // 与 aplay 保持一致：40ms 缓冲，低延迟，靠饿读追赶而不是靠大缓冲兜底
+            val minBuffer = (frameBytes * 40).coerceAtLeast(minBufferFallback)
             if (minBuffer <= 0) {
                 print2LogView("电脑音箱无法获取缓冲区：rate=$rate channels=$channels result=$minBuffer")
                 writeEmptyResponse(socket, 415, "Unsupported Media Type")
                 return
             } else {
-                print2LogView("电脑音箱连接 缓冲：$minBuffer")
+                print2LogView("电脑音箱连接 缓冲：${minBuffer}B (约${minBuffer * 1000 / frameBytes}ms)")
             }
 
             track = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -823,14 +831,130 @@ internal class CameraHttpServer(
             )
             socket.getOutputStream().flush()
             track.play()
-            val frameBytes = channels * 2
-            val buffer = ByteArray(minBuffer.coerceAtLeast(2048) + frameBytes)
+            frameBytes = channels * 2
+            // 15ms 一块：进程内排队小，跳读的控制粒度也够
+            val buffer = ByteArray(
+                (rate.toLong() * frameBytes * 15 / 1000).toInt().coerceAtLeast(1024) + frameBytes
+            )
+            // 目标是 AudioTrack 自己的缓冲 + 25ms 余量。下位机 CPU 一忙，旧音频
+            // 会攒在 socket 和 AudioTrack 缓冲里(上位机估算不了)，一旦攒下就会
+            // 一直背着；超过目标就从流里直接跳读丢掉，延迟立刻回落。
+            val sinkFrames = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                track.bufferSizeInFrames
+            } else {
+                minBuffer / frameBytes
+            }).coerceAtLeast(1).toLong()
+            val bytesPerMs = rate.toLong() * frameBytes / 1000
+            // 用 AudioTrack 实际给的缓冲当排队基准：请求 40ms 时设备常常给回
+            // 70-80ms，写死会让目标低于真实地板，跳读永远在触发。
+            val sinkLimitBytes: Long = sinkFrames * frameBytes
+            val targetBytes = sinkLimitBytes + bytesPerMs * 25
+            val deadbandBytes = bytesPerMs * 12
+            val maxSkipBytes = bytesPerMs * 250
+            val skipBuf = ByteArray(8 * 1024)
             var pending = 0
+            var readBytes = 0L
+            var skippedBytes = 0L
+            var playedFrames = 0L
+            var lastHead = 0
+            var lastLog = 0L
+            // 饿读追赶：一次读卡住多久，就说明上游攒了多久的旧音频，
+            // 接下来涌来的数据开头那一段就是那么旧，直接丢掉。
+            // 但卡了多久 != 声卡空了多久：缓冲薄时正常等下一批包也要卡 40-60ms，
+            // 这期间声卡一直在放，所以要先减掉声卡当时还剩的积压。
+            var catchUp = 0L
+            // 一次追赶事件里累计丢了多少，只用来打日志：
+            // catchUp 会跨多次读延续，打单轮的量会严重低估。
+            var eventBytes = 0L
+            var armed = true
+            val rearmBytes = bytesPerMs * 30
             while (true) {
+                // 先量后排、再读：只有还没进 AudioTrack 的旧音频才丢得掉
+                val head = track.playbackHeadPosition
+                val delta = (head - lastHead).toLong() and 0xFFFFFFFFL
+                // 每轮最多前进 1 秒；异常的跳变(track 被复位)直接忽略，免得计数崩掉
+                if (delta <= rate) {
+                    playedFrames += delta
+                }
+                lastHead = head
+                val available = try {
+                    request.body.available().toLong()
+                } catch (_: Exception) {
+                    0L
+                }
+                // 播放头在欠载时会停住，这里推算出来的积压会大于缓冲本身，必须夹住
+                val sinkNow = (readBytes - playedFrames * frameBytes - skippedBytes)
+                    .coerceIn(0L, sinkLimitBytes)
+                var excess = sinkNow + available - targetBytes
+                if (excess >= deadbandBytes) {
+                    if (excess > maxSkipBytes) excess = maxSkipBytes
+                    excess -= excess % frameBytes
+                    var dropped = 0L
+                    while (dropped < excess) {
+                        val want = minOf(excess - dropped, skipBuf.size.toLong()).toInt()
+                        val n = request.body.read(skipBuf, 0, want)
+                        if (n <= 0) break
+                        readBytes += n
+                        skippedBytes += n
+                        dropped += n
+                    }
+                    val now = System.currentTimeMillis()
+                    if (dropped > 0 && now - lastLog >= 10000) {
+                        lastLog = now
+                        print2LogView(
+                            "电脑音箱: 排队 ${sinkNow / bytesPerMs}ms " +
+                                "目标 ${targetBytes / bytesPerMs}ms，" +
+                                "跳读 ${dropped / bytesPerMs}ms(累计 ${skippedBytes / bytesPerMs}ms)"
+                        )
+                    }
+                }
+                val readStart = System.nanoTime()
                 val count = request.body.read(buffer, pending, buffer.size - pending)
                 if (count < 0) break
                 if (count == 0) continue
-                val total = pending + count
+                readBytes += count
+                var total = pending + count
+                // 读之前声卡还剩多少没播(字节)，用来区分"正常等包"和"真的断粮"。
+                // 播放头欠载时会停住导致推算偏大，夹到缓冲上限。
+                val sinkBefore = (readBytes - count - playedFrames * frameBytes - skippedBytes)
+                    .coerceIn(0L, sinkLimitBytes)
+                val gapMs = (System.nanoTime() - readStart) / 1_000_000
+                if (!armed) {
+                    // 上一轮刚丢过，等声卡积压回血再重新武装，避免丢完就饿、饿了又丢
+                    if (sinkBefore >= rearmBytes) armed = true
+                } else if (gapMs > 40) {
+                    // 卡住的时间减去声卡当时还能放的时间 = 真正断粮的时长
+                    val starvedMs = gapMs - sinkBefore / bytesPerMs - 20
+                    val owed = minOf(bytesPerMs * starvedMs, maxSkipBytes)
+                        .coerceAtLeast(0L)
+                    if (owed > catchUp) {
+                        catchUp = owed
+                        eventBytes = 0L // 新一轮事件，重新计总量
+                    }
+                }
+                if (catchUp > 0) {
+                    var drop = minOf(catchUp, total.toLong())
+                    drop -= drop % frameBytes // 帧对齐，别把采样劈开
+                    if (drop > 0) {
+                        // pending 里那点尾巴还在前面，一起往后挪
+                        System.arraycopy(
+                            buffer, drop.toInt(), buffer, 0, (total - drop).toInt()
+                        )
+                        total -= drop.toInt()
+                        catchUp -= drop
+                        skippedBytes += drop
+                        eventBytes += drop
+                        if (catchUp == 0L) armed = false // 丢完了，等声卡回血
+                        val now = System.currentTimeMillis()
+                        if (now - lastLog >= 10000) {
+                            lastLog = now
+                            print2LogView(
+                                "电脑音箱: 饿读追赶 卡了 ${gapMs}ms 声卡剩 ${sinkBefore / bytesPerMs}ms，" +
+                                    "本次共丢 ${eventBytes / bytesPerMs}ms(累计 ${skippedBytes / bytesPerMs}ms)"
+                            )
+                        }
+                    }
+                }
                 val writable = total - (total % frameBytes)
                 var offset = 0
                 while (offset < writable) {
