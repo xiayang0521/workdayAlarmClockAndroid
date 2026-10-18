@@ -22,3 +22,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "workdayAlarmClock"
 include ':app'
+include ':viewer'
+include ':storageServer'

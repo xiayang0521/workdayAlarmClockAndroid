@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 回看网格缩略图：ImageView 用此 tag 记录当前绑定的缓存 key，做世代/复用校验。 -->
+    <item name="thumb_tag" type="id" />
+</resources>

@@ -29,10 +29,15 @@ import com.zyyme.workdayalarmclock.applist.AppListActivity
 import com.zyyme.workdayalarmclock.camera.AmbientBrightnessController
 import com.zyyme.workdayalarmclock.camera.FramebufferFrameRenderer
 import com.zyyme.workdayalarmclock.camera.CameraHttpServer
+import com.zyyme.workdayalarmclock.camera.LanDomain
 import com.zyyme.workdayalarmclock.record.CameraRecorder
+import com.zyyme.workdayalarmclock.record.DeliveryTarget
+import com.zyyme.workdayalarmclock.record.LocalCacheJanitor
 import com.zyyme.workdayalarmclock.record.RecordConfig
 import com.zyyme.workdayalarmclock.record.RecordingAccess
 import com.zyyme.workdayalarmclock.record.RecordingUploadManager
+import com.zyyme.workdayalarmclock.record.SegmentDeliveryTracker
+import com.zyyme.workdayalarmclock.record.UsbRecordSink
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -147,6 +152,9 @@ class MeService : Service() {
     private var udpServerSocket: DatagramSocket? = null
     private var cameraHttpServer: CameraHttpServer? = null
     private var recordUploadManager: RecordingUploadManager? = null
+    private var usbRecordSink: UsbRecordSink? = null
+    private var deliveryTracker: SegmentDeliveryTracker? = null
+    private var localCacheJanitor: LocalCacheJanitor? = null
     private var cameraRecorder: CameraRecorder? = null
     @Volatile private var framebufferStreaming = false
     @Volatile private var screenOffWhenStreamStop = false
@@ -219,11 +227,32 @@ class MeService : Service() {
         ambientBrightness = AmbientBrightnessController(this) { message ->
             print2LogView(message)
         }
+        // 录像暂存目录：录像器写分钟分段，NAS 上传器与 USB 投递器共同消费。
+        val recordingDir = File(filesDir, "recordings")
+        // 同一段录像可能要同时发 NAS 和 USB；两者都成功后才允许按缓存上限删除本地暂存。
+        val tracker = SegmentDeliveryTracker()
+        val janitor = LocalCacheJanitor(recordingDir) { message -> print2LogView(message) }
+        deliveryTracker = tracker
+        localCacheJanitor = janitor
         recordUploadManager = RecordingUploadManager(
             this,
-            File(filesDir, "recordings"),
+            recordingDir,
+            tracker,
+            janitor,
             { message -> print2LogView(message) }
-        ).also { it.start() }
+        )
+        usbRecordSink = UsbRecordSink(
+            this,
+            recordingDir,
+            tracker,
+            janitor,
+            { message -> print2LogView(message) }
+        )
+        // 关键：在两个消费者开始扫描/补传之前，先为暂存目录已有分段登记目的地，
+        // 避免某一目的地先完成时被本地缓存清理误删（另一目的地尚未补传）。
+        seedExistingDeliveryTargets(recordingDir, tracker)
+        recordUploadManager?.start()
+        usbRecordSink?.start()
     }
 
 
@@ -554,6 +583,7 @@ class MeService : Service() {
         ) {
             cameraHttpServer?.stop()
             cameraHttpServer = null
+            LanDomain.unregister(this)
             syncRecorder(null)
             return
         }
@@ -576,7 +606,19 @@ class MeService : Service() {
             }
         ).also { cameraHttpServer = it }
         server.setRecordingAccess(recordUploadManager)
+        // 客户端（viewer 摄像头设置）改存储配置后，让 USB 投递器立即按新开关补传/停传
+        server.setOnStorageSettingsChangedListener {
+            usbRecordSink?.kick()
+            syncRecorder(cameraHttpServer)
+        }
         server.start(MeSettings.getCameraPassword(this))
+        val lanDomain = MeSettings.getLanDomain(this)
+        server.updateLanInfo(lanDomain, getIp())
+        server.updateRecordRotation(MeSettings.getRecordRotation(this))
+        if (LanDomain.currentName() == null) {
+            LanDomain.register(this, lanDomain, CameraHttpServer.PORT)
+            print2LogView("局域网域名：http://$lanDomain.local:${CameraHttpServer.PORT} 或 http://设备ip:${CameraHttpServer.PORT}")
+        }
         syncRecorder(if (recordWanted) server else null)
     }
 
@@ -586,8 +628,27 @@ class MeService : Service() {
             hasCameraPermission()
     }
 
+    /**
+     * 应用重启后，为暂存目录中尚未投递的分段预先登记所需目的地。
+     * 这样即使 NAS 比 USB 先补传完成，本地缓存清理也不会提前删掉原件。
+     */
+    private fun seedExistingDeliveryTargets(dir: File, tracker: SegmentDeliveryTracker) {
+        val targets = buildList {
+            if (MeSettings.isNasConfigured(this@MeService)) add(DeliveryTarget.NAS)
+            if (MeSettings.isUsbRecordConfigured(this@MeService)) add(DeliveryTarget.USB)
+        }
+        if (targets.isEmpty()) return
+        dir.listFiles()?.forEach { file ->
+            if (file.isFile && com.zyyme.workdayalarmclock.record.RecordingNames.isRecording(file.name)) {
+                tracker.register(file.name, targets)
+            }
+        }
+    }
+
     @Synchronized
     private fun syncRecorder(server: CameraHttpServer?) {
+        // 设置可能在运行中刚开启 USB，顺带把暂存目录已有分段补入 USB 投递队列。
+        usbRecordSink?.kick()
         val wantedConfig = if (server == null) {
             null
         } else {
@@ -595,7 +656,10 @@ class MeService : Service() {
             RecordConfig(
                 cameraIndex = MeSettings.getRecordCameraIndex(this),
                 targetHeight = MeSettings.getRecordHeight(this),
-                withAudio = withAudio
+                withAudio = withAudio,
+                rotationDegrees = MeSettings.getRecordRotation(this),
+                staticPolicy = MeSettings.getRecordStaticPolicy(this),
+                codec = MeSettings.getRecordCodec(this)
             )
         }
         val current = cameraRecorder
@@ -608,11 +672,22 @@ class MeService : Service() {
         current?.stop()
         val outputDir = File(filesDir, "recordings")
         val uploadManager = recordUploadManager
+        val usbSink = usbRecordSink
+        val tracker = deliveryTracker
         val recorder = CameraRecorder(
             serverProvider = { cameraHttpServer },
             config = wantedConfig,
             outputDir = outputDir,
-            onSegmentReady = { segment -> uploadManager?.enqueue(segment) },
+            onSegmentReady = { segment ->
+                // 按当前目的地配置分发；NAS 与 USB 可同时启用，各自独立重试/清理。
+                val targets = buildList {
+                    if (MeSettings.isNasConfigured(this@MeService)) add(DeliveryTarget.NAS)
+                    if (MeSettings.isUsbRecordConfigured(this@MeService)) add(DeliveryTarget.USB)
+                }
+                tracker?.register(segment.key, targets)
+                if (targets.contains(DeliveryTarget.NAS)) uploadManager?.enqueue(segment)
+                if (targets.contains(DeliveryTarget.USB)) usbSink?.enqueue(segment.file)
+            },
             log = { message -> print2LogView(message) }
         )
         cameraRecorder = recorder
@@ -729,6 +804,14 @@ class MeService : Service() {
         cameraHttpServer?.updatePassword(MeSettings.getCameraPassword(this))
     }
 
+    /** 重启摄像头 HTTP 服务与编码管线（编码格式/静止策略变更后调用）。 */
+    fun restartCameraServer() {
+        cameraHttpServer?.stop()
+        cameraHttpServer = null
+        LanDomain.unregister(this)
+        syncCameraServerSetting()
+    }
+
     private fun hasCameraPermission(): Boolean {
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
             checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -769,8 +852,11 @@ class MeService : Service() {
         cameraRecorder = null
         recordUploadManager?.stop()
         recordUploadManager = null
+        usbRecordSink?.stop()
+        usbRecordSink = null
         cameraHttpServer?.stop()
         cameraHttpServer = null
+        LanDomain.unregister(this)
         if (::ambientBrightness.isInitialized) {
             ambientBrightness.shutdown()
         }

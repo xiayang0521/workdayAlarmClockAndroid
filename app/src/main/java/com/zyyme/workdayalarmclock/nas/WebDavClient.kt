@@ -33,6 +33,9 @@ internal class WebDavClient(
         private const val CONNECT_TIMEOUT = 12_000
         private const val READ_TIMEOUT = 30_000
         private const val UPLOAD_READ_TIMEOUT = 120_000
+        private val IPV4 = Regex(
+            "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$"
+        )
     }
 
     private val methodsWorkaround = arrayOf("MKCOL", "PROPFIND")
@@ -48,10 +51,44 @@ internal class WebDavClient(
 
     private fun resolveUrl(remotePath: String): String {
         val cleanPath = remotePath.trim().trimStart('/')
+        val base = resolveHost(baseUrl)
         return if (cleanPath.isEmpty()) {
-            "$baseUrl/"
+            "$base/"
         } else {
-            "$baseUrl/${encodePath(cleanPath)}"
+            "$base/${encodePath(cleanPath)}"
+        }
+    }
+
+    /**
+     * 局域网域名（workdayXXXXXX / xxx.local）在连接前解析成 IP：
+     * 系统解析器支持 mDNS 的机型直接成功；否则补试 ".local" 后缀。
+     * 解析失败时原样返回，让连接层报错。
+     */
+    private fun resolveHost(url: String): String {
+        return try {
+            val parsed = URL(url)
+            val host = parsed.host
+            if (host.isEmpty() || IPV4.matches(host)) return url
+            val resolved = try {
+                java.net.InetAddress.getByName(host)
+            } catch (_: Exception) {
+                if (host.endsWith(".local")) {
+                    null
+                } else {
+                    try {
+                        java.net.InetAddress.getByName("$host.local")
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+            }
+            if (resolved == null) {
+                url
+            } else {
+                URL(parsed.protocol, resolved.hostAddress, parsed.port, parsed.file).toString()
+            }
+        } catch (_: Exception) {
+            url
         }
     }
 
@@ -118,7 +155,8 @@ internal class WebDavClient(
             connection.outputStream.use { output ->
                 output.write(PROPFIND_REQUEST_BYTES)
             }
-            ensureSuccess(connection, intArrayOf(HttpURLConnection.HTTP_OK, HttpURLConnection.HTTP_MULT_CHOICE))
+            ensureSuccess(connection, intArrayOf(
+                HttpURLConnection.HTTP_OK, 207 /* WebDAV Multi-Status */))
         } finally {
             connection.disconnect()
         }
@@ -238,7 +276,8 @@ internal class WebDavClient(
             connection.setRequestProperty("Content-Type", "application/xml; charset=utf-8")
             connection.doOutput = true
             connection.outputStream.use { it.write(PROPFIND_REQUEST_BYTES) }
-            ensureSuccess(connection, intArrayOf(HttpURLConnection.HTTP_OK, HttpURLConnection.HTTP_MULT_CHOICE))
+            ensureSuccess(connection, intArrayOf(
+                HttpURLConnection.HTTP_OK, 207 /* WebDAV Multi-Status */))
             val input: InputStream = connection.inputStream
             return input.use { parsePropFind(it) }
         } finally {

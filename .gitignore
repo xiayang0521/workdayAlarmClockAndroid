@@ -22,3 +22,11 @@ app/full
 app/nolauncher
 app/x86
 app/arm7
+/deliverables
+/screen.png
+/sps.bin
+/spsprobe.bin
+/analysis_*.mp4
+/.idea/PICTURES
+viewer/build/
+storageServer/build/

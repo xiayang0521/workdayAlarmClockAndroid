@@ -47,6 +47,11 @@ object MeSettings {
     const val KEY_RECORD_CAMERA_INDEX = "record_camera_index"
     const val KEY_RECORD_HEIGHT = "record_height"
     const val KEY_RECORD_AUDIO = "record_audio"
+    const val KEY_RECORD_ROTATION = "record_rotation"
+    const val KEY_RECORD_STATIC_POLICY = "record_static_policy"
+    const val KEY_RECORD_MOTION_SENS = "record_motion_sens"
+    const val KEY_RECORD_CODEC = "record_codec"
+    const val KEY_RECORD_FPS = "record_fps"
     const val KEY_WEBDAV_URL = "webdav_url"
     const val KEY_WEBDAV_USERNAME = "webdav_username"
     const val KEY_WEBDAV_PASSWORD = "webdav_password"
@@ -55,6 +60,12 @@ object MeSettings {
     const val KEY_QUOTA_RESERVE_MB = "quota_reserve_mb"
     const val KEY_QUOTA_LIMIT_MB = "quota_limit_mb"
     const val KEY_LOCAL_CACHE_MB = "local_cache_mb"
+    const val KEY_USB_RECORD_ENABLED = "usb_record_enabled"
+    const val KEY_USB_RECORD_TREE_URI = "usb_record_tree_uri"
+    // 无屏设备远程指定的 USB 真实目录（形如 /storage/1A2B-3C4D/workday），
+    // 与 SAF treeUri 二选一：此路径非空时走 File 直写后端，免本机目录授权弹窗。
+    const val KEY_USB_RECORD_FS_PATH = "usb_record_fs_path"
+    const val KEY_LAN_DOMAIN = "lan_domain"
     const val KEY_DESK_MASK = "desk_mask"
     const val KEY_DESK_LIGHT_TEXT = "desk_light_text"
     const val KEY_DESK_KEEP_SCREEN_ON = "desk_keep_screen_on"
@@ -231,6 +242,85 @@ object MeSettings {
         setEnabled(context, KEY_RECORD_AUDIO, enabled)
     }
 
+    /** 录像画面旋转角度（0/90/180/270），写入 MP4 方向矩阵，播放器据此转正画面。 */
+    fun getRecordRotation(context: Context): Int {
+        val value = getInt(context, KEY_RECORD_ROTATION, 0)
+        return if (value == 90 || value == 180 || value == 270) value else 0
+    }
+
+    fun setRecordRotation(context: Context, rotation: Int) {
+        setInt(context, KEY_RECORD_ROTATION, rotation)
+    }
+
+    // 静止检测策略：0=全录（默认），1=A 抽帧录像（只存关键帧，约1fps），
+    // 2=B 动态码率（静止时降到 100kbps），3=A+B
+    const val STATIC_POLICY_ALL = 0
+    const val STATIC_POLICY_TIMELAPSE = 1
+    const val STATIC_POLICY_LOW_BITRATE = 2
+    const val STATIC_POLICY_BOTH = 3
+
+    fun getRecordStaticPolicy(context: Context): Int {
+        val value = getInt(context, KEY_RECORD_STATIC_POLICY, STATIC_POLICY_ALL)
+        return if (value in STATIC_POLICY_ALL..STATIC_POLICY_BOTH) value else STATIC_POLICY_ALL
+    }
+
+    fun setRecordStaticPolicy(context: Context, policy: Int) {
+        setInt(context, KEY_RECORD_STATIC_POLICY, policy)
+    }
+
+    /** 静止检测灵敏度：0=高(0.3%) 1=中(0.6%) 2=低(1.5%)。 */
+    fun getRecordMotionSensitivity(context: Context): Int {
+        val value = getInt(context, KEY_RECORD_MOTION_SENS, 1)
+        return if (value in 0..2) value else 1
+    }
+
+    fun setRecordMotionSensitivity(context: Context, level: Int) {
+        setInt(context, KEY_RECORD_MOTION_SENS, level)
+    }
+
+    /** 差异像素占比阈值（按灵敏度）。 */
+    fun motionThresholdRatio(context: Context): Double {
+        return when (getRecordMotionSensitivity(context)) {
+            0 -> 0.003
+            2 -> 0.015
+            else -> 0.006
+        }
+    }
+
+    const val CODEC_H264 = "h264"
+    const val CODEC_H265 = "h265"
+
+    /** 视频编码格式（影响直播和录像；切换后需重启摄像头服务）。 */
+    fun getRecordCodec(context: Context): String {
+        return if (getString(context, KEY_RECORD_CODEC, CODEC_H264) == CODEC_H265) {
+            CODEC_H265
+        } else {
+            CODEC_H264
+        }
+    }
+
+    fun setRecordCodec(context: Context, codec: String) {
+        setString(context, KEY_RECORD_CODEC, codec)
+    }
+
+    /** 录像帧率：10~30，默认 20（影响直播和录像；切换后需重启摄像头服务）。 */
+    const val RECORD_FPS_MIN = 10
+    const val RECORD_FPS_MAX = 30
+    const val RECORD_FPS_DEFAULT = 20
+
+    fun getRecordFps(context: Context): Int {
+        val value = getInt(context, KEY_RECORD_FPS, RECORD_FPS_DEFAULT)
+        return if (value in RECORD_FPS_MIN..RECORD_FPS_MAX) value else RECORD_FPS_DEFAULT
+    }
+
+    fun setRecordFps(context: Context, fps: Int) {
+        setInt(
+            context,
+            KEY_RECORD_FPS,
+            fps.coerceIn(RECORD_FPS_MIN, RECORD_FPS_MAX)
+        )
+    }
+
     fun getWebDavUrl(context: Context): String {
         return getString(context, KEY_WEBDAV_URL, "").trim().trimEnd('/')
     }
@@ -296,7 +386,66 @@ object MeSettings {
         setInt(context, KEY_LOCAL_CACHE_MB, mb)
     }
 
-    fun isRecordConfigured(context: Context): Boolean {
+    /** 是否把录像同时复制到本机 USB 存储（OTG U 盘等）。 */
+    fun isUsbRecordEnabled(context: Context): Boolean {
+        return isEnabled(context, KEY_USB_RECORD_ENABLED)
+    }
+
+    fun setUsbRecordEnabled(context: Context, enabled: Boolean) {
+        setEnabled(context, KEY_USB_RECORD_ENABLED, enabled)
+    }
+
+    /**
+     * USB 目标目录的 SAF tree uri（形如 content://com.android.externalstorage.documents/tree/...）。
+     * 持久化授权后跨重启可用；U 盘未插入时该 uri 暂时不可访问，属正常情况。
+     */
+    fun getUsbRecordTreeUri(context: Context): String {
+        return getString(context, KEY_USB_RECORD_TREE_URI, "").trim()
+    }
+
+    fun setUsbRecordTreeUri(context: Context, treeUri: String) {
+        setString(context, KEY_USB_RECORD_TREE_URI, treeUri.trim())
+    }
+
+    /**
+     * USB 目标目录的真实文件系统路径（远程配置、免 SAF 授权）。
+     * 形如 /storage/1A2B-3C4D/workday；为空表示仍走 SAF treeUri 后端。
+     */
+    fun getUsbRecordFsPath(context: Context): String {
+        return getString(context, KEY_USB_RECORD_FS_PATH, "").trim().trimEnd('/')
+    }
+
+    fun setUsbRecordFsPath(context: Context, fsPath: String) {
+        setString(context, KEY_USB_RECORD_FS_PATH, fsPath.trim().trimEnd('/'))
+    }
+
+    /** NAS（WebDAV）已配置地址。 */
+    fun isNasConfigured(context: Context): Boolean {
         return getWebDavUrl(context).isNotEmpty()
+    }
+
+    /** USB 录像目标可用：开关打开，且已通过 SAF 授权目录或远程真实路径任一方式选定目录。 */
+    fun isUsbRecordConfigured(context: Context): Boolean {
+        if (!isUsbRecordEnabled(context)) return false
+        return getUsbRecordTreeUri(context).isNotEmpty() ||
+            getUsbRecordFsPath(context).isNotEmpty()
+    }
+
+    /** 至少配置了一个录像目的地（NAS 或本机 USB），录像才需要启动。 */
+    fun isRecordConfigured(context: Context): Boolean {
+        return isNasConfigured(context) || isUsbRecordConfigured(context)
+    }
+
+    /**
+     * 局域网 mDNS 域名（workday + 6 位随机数字，形如 workday483920）。
+     * 首次调用时生成并持久化，之后保持不变；局域网内可通过
+     * http://workday483920.local:8880 访问摄像头后台。
+     */
+    fun getLanDomain(context: Context): String {
+        val saved = getString(context, KEY_LAN_DOMAIN, "")
+        if (saved.isNotEmpty()) return saved
+        val generated = "workday" + (100000 + java.util.Random().nextInt(900000))
+        setString(context, KEY_LAN_DOMAIN, generated)
+        return generated
     }
 }

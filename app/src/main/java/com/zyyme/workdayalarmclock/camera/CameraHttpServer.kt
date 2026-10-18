@@ -26,7 +26,12 @@ import androidx.core.view.WindowInsetsCompat
 import com.zyyme.workdayalarmclock.ClockActivity
 import com.zyyme.workdayalarmclock.DeskActivity
 import com.zyyme.workdayalarmclock.MeService
+import com.zyyme.workdayalarmclock.BuildConfig
+import com.zyyme.workdayalarmclock.MeSettings
 import com.zyyme.workdayalarmclock.record.RecordingAccess
+import com.zyyme.workdayalarmclock.nas.WebDavClient
+import com.zyyme.workdayalarmclock.record.FsUsbRecordStore
+import com.zyyme.workdayalarmclock.record.UsbRecordTargets
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
@@ -37,6 +42,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.nio.charset.Charset
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -60,6 +66,10 @@ internal class CameraHttpServer(
     companion object {
         const val PORT = 8880
         private const val MAX_JPEG_FRAME_BYTES = 16 * 1024 * 1024
+
+        /** 等待 AVC 管线吐出参数集的上限；MJPEG 管线会立即返回 null。 */
+        private const val AVC_CONFIG_WAIT_MS = 3_000L
+        private val ANNEX_B_START = byteArrayOf(0, 0, 0, 1)
         private val HTTP_CHARSET: Charset = Charset.forName("US-ASCII")
         private val HTML_CHARSET: Charset = Charset.forName("UTF-8")
     }
@@ -77,7 +87,12 @@ internal class CameraHttpServer(
     private var recordingAudio = false
     private val framebufferStreamActive = AtomicBoolean(false)
     @Volatile private var password = ""
+    @Volatile private var lanDomain: String = ""
+    @Volatile private var lanIp: String = ""
+    @Volatile private var recordRotation: Int = 0
     @Volatile private var recordingAccess: RecordingAccess? = null
+    /** 存储设置（USB 开关/配额）被客户端修改后回调，用于让 USB 投递器立即按新配置工作。 */
+    @Volatile private var onStorageSettingsChanged: (() -> Unit)? = null
     private var serverSocket: ServerSocket? = null
     private var acceptThread: Thread? = null
     @Volatile private var activeFramebufferSocket: Socket? = null
@@ -118,6 +133,44 @@ internal class CameraHttpServer(
 
     fun setRecordingAccess(access: RecordingAccess?) {
         recordingAccess = access
+    }
+
+    /** 注册存储设置变更回调（由 MeService 设置，内部触发 USB 投递器重新评估配置）。 */
+    fun setOnStorageSettingsChangedListener(listener: (() -> Unit)?) {
+        onStorageSettingsChanged = listener
+    }
+
+    /** 更新页面顶部展示的局域网访问信息（mDNS 域名与本机 IP）。 */
+    fun updateLanInfo(domain: String, ip: String) {
+        lanDomain = domain.trim()
+        lanIp = ip.trim()
+    }
+
+    /** 同步录像旋转角度到直播页（所见即所得：页面初始旋转与录像旋转一致）。 */
+    fun updateRecordRotation(degrees: Int) {
+        recordRotation = if (degrees == 90 || degrees == 180 || degrees == 270) degrees else 0
+    }
+
+    private fun lanInfoBanner(): String {
+        val parts = mutableListOf<String>()
+        if (lanDomain.isNotEmpty()) {
+            parts.add("<a href=\"http://$lanDomain.local:$PORT\">http://$lanDomain.local:$PORT</a>")
+        }
+        if (lanIp.isNotEmpty() && lanIp != lanDomain) {
+            parts.add("<a href=\"http://$lanIp:$PORT\">http://$lanIp:$PORT</a>")
+        }
+        if (parts.isEmpty()) return ""
+        val pwdText = if (password.isEmpty()) "无密码" else "密码：$password"
+        return "<div id=\"laninfo\" style=\"margin:0 0 10px;font-size:13px;color:#8b949e\">" +
+            "局域网访问（$pwdText）：" + parts.joinToString("　或　") + "</div>"
+    }
+
+    private fun injectBanner(page: String): String {
+        return if (page.contains("__LANINFO__")) {
+            page.replace("__LANINFO__", lanInfoBanner())
+        } else {
+            page
+        }
     }
 
     fun updatePassword(cameraPassword: String) {
@@ -209,6 +262,12 @@ internal class CameraHttpServer(
             if (handleRecordingRoute(socket, request, path)) {
                 return
             }
+            if (handleCameraSettingsRoute(socket, request, path)) {
+                return
+            }
+            if (handleCameraStorageRoute(socket, request, path)) {
+                return
+            }
             if (!cameraEnabled()) {
                 writeEmptyResponse(socket, 404, "Not Found")
                 return
@@ -263,7 +322,11 @@ internal class CameraHttpServer(
                 }
             }
         } catch (e: Exception) {
-            print2LogView("HTTP客户端处理失败：${e.javaClass.simpleName}: ${e.message ?: "无错误信息"}")
+            if (e is SocketException || e is SocketTimeoutException) {
+                // 客户端主动断开（如拖动进度条取消未完成的 Range 下载），属正常现象，静默处理
+            } else {
+                print2LogView("HTTP客户端处理失败：${e.javaClass.simpleName}: ${e.message ?: "无错误信息"}")
+            }
         } finally {
             releaseClient(socket, pipeline)
             releaseAudioClient(socket, audioPipeline)
@@ -281,7 +344,8 @@ internal class CameraHttpServer(
         val body: InputStream,
         val expectContinue: Boolean,
         val contentType: String?,
-        val rangeHeader: String?
+        val rangeHeader: String?,
+        val contentLength: Int
     )
 
     private fun readRequest(socket: Socket): HttpRequest? {
@@ -295,6 +359,7 @@ internal class CameraHttpServer(
         var expectContinue = false
         var contentType: String? = null
         var rangeHeader: String? = null
+        var contentLength = -1
         while (true) {
             val line = readHttpLine(input) ?: return null
             if (line.isEmpty()) break
@@ -315,6 +380,9 @@ internal class CameraHttpServer(
             if (headerName.equals("Range", ignoreCase = true)) {
                 rangeHeader = headerValue
             }
+            if (headerName.equals("Content-Length", ignoreCase = true)) {
+                contentLength = headerValue.toIntOrNull() ?: -1
+            }
         }
 
         val uri = try {
@@ -331,7 +399,8 @@ internal class CameraHttpServer(
             body,
             expectContinue,
             contentType,
-            rangeHeader
+            rangeHeader,
+            contentLength
         )
     }
 
@@ -1253,17 +1322,47 @@ internal class CameraHttpServer(
         )
         output.flush()
 
+        // 录像会话占用视频管线时，本通道下发的其实是 H.264 而不是 JPEG（客户端按帧头自动判别）。
+        // 硬编码器只在 codec-config 缓冲里给出 SPS/PPS，关键帧通常不重复携带，客户端因此永远
+        // 拿不到参数集、解码器无法创建（表现为"已连接但黑屏"）。这里先补发一帧参数集。
+        val avcConfig = pipeline.awaitAvcConfig(AVC_CONFIG_WAIT_MS)
+        if (avcConfig != null) {
+            pipeline.requestKeyFrame()
+            buildAnnexBConfigFrame(avcConfig)?.let { writeMjpegFrame(output, it) }
+        }
+
         var sequence = 0L
         while (running.get() && !socket.isClosed) {
             val packet = pipeline.awaitPacket(sequence) ?: break
             sequence = packet.sequence
-            output.write("--frame\r\n".toByteArray(HTTP_CHARSET))
-            output.write("Content-Type: image/jpeg\r\n".toByteArray(HTTP_CHARSET))
-            output.write("Content-Length: ${packet.data.size}\r\n\r\n".toByteArray(HTTP_CHARSET))
-            output.write(packet.data)
-            output.write("\r\n".toByteArray(HTTP_CHARSET))
-            output.flush()
+            writeMjpegFrame(output, packet.data)
         }
+    }
+
+    /** 写一帧 multipart 分片，载荷既可是 JPEG 也可是 H.264 码流。 */
+    private fun writeMjpegFrame(output: java.io.OutputStream, payload: ByteArray) {
+        output.write("--frame\r\n".toByteArray(HTTP_CHARSET))
+        output.write("Content-Type: image/jpeg\r\n".toByteArray(HTTP_CHARSET))
+        output.write("Content-Length: ${payload.size}\r\n\r\n".toByteArray(HTTP_CHARSET))
+        output.write(payload)
+        output.write("\r\n".toByteArray(HTTP_CHARSET))
+        output.flush()
+    }
+
+    /**
+     * 把 SPS/PPS 拼成一帧 AnnexB 码流（各自前置 00 00 00 01 起始码）。
+     * 录像管线里的参数集是剥离了起始码的裸 NAL，所以这里要自己补上。
+     */
+    private fun buildAnnexBConfigFrame(config: AvcStreamConfig): ByteArray? {
+        if (config.sps.isEmpty() || config.pps.isEmpty()) return null
+        val out = java.io.ByteArrayOutputStream(
+            config.sps.size + config.pps.size + ANNEX_B_START.size * 2
+        )
+        out.write(ANNEX_B_START)
+        out.write(config.sps)
+        out.write(ANNEX_B_START)
+        out.write(config.pps)
+        return out.toByteArray()
     }
 
     private fun streamAvc(
@@ -1326,6 +1425,513 @@ internal class CameraHttpServer(
         }
     }
 
+    // ---------- 摄像头设置读写（供 viewer 等客户端使用） ----------
+
+    private fun isCameraSettingsRoute(path: String): Boolean {
+        val prefix = if (password.isEmpty()) "" else "/$password"
+        return path == "$prefix/cam/settings"
+    }
+
+    private fun writeJsonResponse(socket: Socket, status: Int, reason: String, json: String) {
+        val body = json.toByteArray(HTML_CHARSET)
+        val header = "HTTP/1.0 $status $reason\r\n" +
+            "Connection: close\r\n" +
+            "Cache-Control: no-cache, no-store\r\n" +
+            "Content-Type: application/json; charset=utf-8\r\n" +
+            "Content-Length: ${body.size}\r\n\r\n"
+        val output = socket.getOutputStream()
+        output.write(header.toByteArray(HTTP_CHARSET))
+        output.write(body)
+        output.flush()
+    }
+
+    /**
+     * 读取并解析 POST/PUT 的 JSON 请求体（上限 64KB，防止异常客户端拖垮内存）。
+     * 解析失败时已向客户端写好 400 响应并返回 null，调用方直接 return 即可。
+     */
+    private fun readJsonBody(socket: Socket, request: HttpRequest): org.json.JSONObject? {
+        if (request.contentLength <= 0 || request.contentLength > 64 * 1024) {
+            writeJsonResponse(socket, 400, "Bad Request",
+                org.json.JSONObject().put("ok", false).put("error", "empty body").toString())
+            return null
+        }
+        val bytes = ByteArray(request.contentLength)
+        var off = 0
+        while (off < bytes.size) {
+            val n = request.body.read(bytes, off, bytes.size - off)
+            if (n < 0) break
+            off += n
+        }
+        return try {
+            org.json.JSONObject(String(bytes, 0, off, HTML_CHARSET))
+        } catch (e: Exception) {
+            writeJsonResponse(socket, 400, "Bad Request",
+                org.json.JSONObject().put("ok", false)
+                    .put("error", e.message ?: "bad json").toString())
+            null
+        }
+    }
+
+    private fun handleCameraSettingsRoute(
+        socket: Socket,
+        request: HttpRequest,
+        path: String?
+    ): Boolean {
+        if (path == null || !isCameraSettingsRoute(path)) return false
+        when (request.method) {
+            "GET" -> writeCameraSettings(socket)
+            "POST", "PUT" -> applyCameraSettings(socket, request)
+            else -> writeEmptyResponse(socket, 405, "Method Not Allowed")
+        }
+        return true
+    }
+
+    private fun writeCameraSettings(socket: Socket) {
+        val ctx = appContext
+        val json = org.json.JSONObject()
+            .put("rotation", MeSettings.getRecordRotation(ctx))
+            .put("codec", MeSettings.getRecordCodec(ctx))
+            .put("fps", MeSettings.getRecordFps(ctx))
+            .put("height", MeSettings.getRecordHeight(ctx))
+            .put("audio", MeSettings.isRecordAudioEnabled(ctx))
+            .put("policy", MeSettings.getRecordStaticPolicy(ctx))
+            .put("sens", MeSettings.getRecordMotionSensitivity(ctx))
+            .toString()
+        writeJsonResponse(socket, 200, "OK", json)
+    }
+
+    private fun applyCameraSettings(socket: Socket, request: HttpRequest) {
+        try {
+            if (request.contentLength <= 0 || request.contentLength > 64 * 1024) {
+                writeJsonResponse(socket, 400, "Bad Request",
+                    org.json.JSONObject().put("ok", false).put("error", "empty body").toString())
+                return
+            }
+            val bytes = ByteArray(request.contentLength)
+            var off = 0
+            while (off < bytes.size) {
+                val n = request.body.read(bytes, off, bytes.size - off)
+                if (n < 0) break
+                off += n
+            }
+            val root = org.json.JSONObject(String(bytes, 0, off, HTML_CHARSET))
+            val ctx = appContext
+
+            if (root.has("rotation")) {
+                val v = root.getInt("rotation")
+                MeSettings.setRecordRotation(ctx, if (v == 90 || v == 180 || v == 270) v else 0)
+            }
+            if (root.has("codec")) {
+                val v = root.getString("codec")
+                MeSettings.setRecordCodec(ctx,
+                    if (v == MeSettings.CODEC_H265) MeSettings.CODEC_H265 else MeSettings.CODEC_H264)
+            }
+            if (root.has("fps")) {
+                val v = root.getInt("fps")
+                MeSettings.setRecordFps(ctx, v)
+            }
+            if (root.has("height")) {
+                val v = root.getInt("height")
+                MeSettings.setRecordHeight(ctx,
+                    if (v == MeSettings.RECORD_HEIGHT_720) {
+                        MeSettings.RECORD_HEIGHT_720
+                    } else {
+                        MeSettings.RECORD_HEIGHT_1080
+                    })
+            }
+            if (root.has("audio")) {
+                MeSettings.setRecordAudioEnabled(ctx, root.getBoolean("audio"))
+            }
+            if (root.has("policy")) {
+                MeSettings.setRecordStaticPolicy(ctx, root.getInt("policy"))
+            }
+            if (root.has("sens")) {
+                MeSettings.setRecordMotionSensitivity(ctx, root.getInt("sens"))
+            }
+
+            writeJsonResponse(socket, 200, "OK",
+                org.json.JSONObject().put("ok", true).toString())
+            // 旋转/编码/帧率/清晰度影响编码器配置，回复发出后延迟重启摄像头服务使其生效。
+            Thread {
+                try {
+                    Thread.sleep(400)
+                } catch (_: Exception) {
+                }
+                MeService.me?.restartCameraServer()
+            }.start()
+        } catch (e: Exception) {
+            writeJsonResponse(socket, 400, "Bad Request",
+                org.json.JSONObject().put("ok", false)
+                    .put("error", e.message ?: "bad json").toString())
+        }
+    }
+
+    // ---------- 录像存储配置读写（本地暂存 / USB / NAS / 配额） ----------
+
+    private fun storagePrefix(): String = if (password.isEmpty()) "" else "/$password"
+
+    private fun isCameraStorageRoute(path: String): Boolean {
+        val base = "${storagePrefix()}/cam/storage"
+        return path == base || path == "$base/nas/test" || path == "$base/volumes"
+    }
+
+    private fun handleCameraStorageRoute(
+        socket: Socket,
+        request: HttpRequest,
+        path: String?
+    ): Boolean {
+        if (path == null || !isCameraStorageRoute(path)) return false
+        val base = "${storagePrefix()}/cam/storage"
+        when {
+            path == "$base/nas/test" -> {
+                // NAS 测试连接：用提交的参数实测，保存与否都可测（无屏设备排查配置用）。
+                if (request.method != "POST" && request.method != "PUT") {
+                    writeEmptyResponse(socket, 405, "Method Not Allowed")
+                } else {
+                    testNasConnection(socket, request)
+                }
+            }
+            path == "$base/volumes" -> {
+                // 枚举可移动存储卷，供 viewer 远程选择 USB 录像目录。
+                if (request.method != "GET") {
+                    writeEmptyResponse(socket, 405, "Method Not Allowed")
+                } else {
+                    writeStorageVolumes(socket)
+                }
+            }
+            else -> when (request.method) {
+                "GET" -> writeCameraStorage(socket)
+                "POST", "PUT" -> applyCameraStorage(socket, request)
+                else -> writeEmptyResponse(socket, 405, "Method Not Allowed")
+            }
+        }
+        return true
+    }
+
+    /**
+     * 返回当前存储配置与各目标空间占用：
+     * local（手机暂存已用）、nas（已用/是否配置）、usb（开关、已用、剩余）、quota（配额方式与数值）。
+     * NAS 统计需要一次 PROPFIND 列表请求，失败时省略 usedBytes 字段（不影响其余信息）。
+     */
+    private fun writeCameraStorage(socket: Socket) {
+        val ctx = appContext
+        val json = org.json.JSONObject()
+        try {
+            json.put("recordEnabled", MeSettings.isRecordEnabled(ctx))
+
+            val localDir = File(ctx.filesDir, "recordings")
+            val localUsed = localDir.listFiles()
+                ?.filter { it.isFile }
+                ?.sumOf { it.length() } ?: 0L
+            json.put("local", org.json.JSONObject()
+                .put("usedBytes", localUsed)
+                .put("cacheMb", MeSettings.getLocalCacheMb(ctx)))
+
+            // NAS（WebDAV）配置：供无屏设备在 viewer 上远程填写。
+            // 安全考虑：密码只回传「是否已设置」，从不回传明文。
+            val nasConfigured = MeSettings.isNasConfigured(ctx)
+            val nasObj = org.json.JSONObject()
+                .put("configured", nasConfigured)
+                .put("url", MeSettings.getWebDavUrl(ctx))
+                .put("username", MeSettings.getWebDavUsername(ctx))
+                .put("dir", MeSettings.getWebDavDir(ctx))
+                .put("hasPassword", MeSettings.getWebDavPassword(ctx).isNotEmpty())
+            if (nasConfigured) {
+                nasUsedBytesAsync(ctx)?.let { nasObj.put("usedBytes", it) }
+            }
+            json.put("nas", nasObj)
+
+            val usbEnabled = MeSettings.isUsbRecordEnabled(ctx)
+            val usbFsPath = MeSettings.getUsbRecordFsPath(ctx)
+            val usbTreeUri = MeSettings.getUsbRecordTreeUri(ctx)
+            // configured 已兼容 SAF 与 fs 直写两种后端；回传当前位置，供 viewer 回显。
+            val usbObj = org.json.JSONObject()
+                .put("enabled", usbEnabled)
+                .put("configured", MeSettings.isUsbRecordConfigured(ctx))
+                .put("fsPath", usbFsPath)
+            if (usbEnabled) {
+                try {
+                    UsbRecordTargets.create(ctx)?.let { store ->
+                        val ready = store.isAvailable()
+                        usbObj.put("ready", ready)
+                        if (ready) {
+                            val files = store.listRecordings()
+                            usbObj.put("count", files.size)
+                            usbObj.put("usedBytes", files.sumOf { it.size })
+                            store.availableBytes()?.let { usbObj.put("availableBytes", it) }
+                        }
+                    }
+                } catch (e: Exception) {
+                    // U 盘拔出或授权失效时其余信息仍可返回
+                }
+            }
+            // treeUri 仅供诊断/兼容，viewer 新流程使用 fsPath；无屏设备一般为空。
+            usbObj.put("hasSafUri", usbTreeUri.isNotEmpty())
+            json.put("usb", usbObj)
+
+            json.put("quota", org.json.JSONObject()
+                .put("mode", MeSettings.getQuotaMode(ctx))
+                .put("reserveMb", MeSettings.getQuotaReserveMb(ctx))
+                .put("limitMb", MeSettings.getQuotaLimitMb(ctx)))
+        } catch (e: Exception) {
+            writeJsonResponse(socket, 500, "Internal Server Error",
+                org.json.JSONObject().put("ok", false)
+                    .put("error", e.message ?: "storage stats failed").toString())
+            return
+        }
+        writeJsonResponse(socket, 200, "OK", json.toString())
+    }
+
+    /**
+     * 用提交的 WebDAV 参数实测连接（PROPFIND 根目录）。
+     * 参数缺省时回退到已保存配置，这样「不改配置只测当前」也能用。
+     * 同步执行：每条 HTTP 连接本就运行在独立工作线程（camera-http-client），
+     * 直接在当前线程回写响应，避免路由返回后 finally 提前关闭 socket。
+     */
+    private fun testNasConnection(socket: Socket, request: HttpRequest) {
+        val root = readJsonBody(socket, request) ?: return
+        // 取参：提交值优先，缺省回退已保存配置；密码留空回退原密码。
+        val ctx = appContext
+        val url = if (root.has("nasUrl")) root.getString("nasUrl").trim().trimEnd('/')
+                  else MeSettings.getWebDavUrl(ctx)
+        val username = if (root.has("nasUsername")) root.getString("nasUsername").trim()
+                       else MeSettings.getWebDavUsername(ctx)
+        val password = if (root.has("nasPassword") && root.getString("nasPassword").isNotEmpty())
+                           root.getString("nasPassword")
+                       else MeSettings.getWebDavPassword(ctx)
+
+        if (url.isEmpty() || !url.startsWith("http://") && !url.startsWith("https://")) {
+            writeJsonResponse(socket, 400, "Bad Request",
+                org.json.JSONObject().put("ok", false)
+                    .put("error", "请填写以 http:// 或 https:// 开头的 NAS 地址").toString())
+            return
+        }
+        val result = org.json.JSONObject()
+        try {
+            WebDavClient(url, username, password).testConnection()
+            result.put("ok", true)
+        } catch (e: Exception) {
+            // 业务失败也回 200，用 ok:false + error 表达，viewer 直接展示错误原因。
+            result.put("ok", false).put("error", e.message ?: "连接失败")
+        }
+        writeJsonResponse(socket, 200, "OK", result.toString())
+    }
+
+    /**
+     * 枚举外部/可移动存储卷，供 viewer 远程选择录像目录。
+     *
+     * 实现要点：
+     * - 用系统 StorageManager.storageVolumes（API24+）取卷，不依赖对 /storage 根目录的读权限
+     *  （该 FUSE 根在部分 ROM 上对普通 App 不可 list），挂载路径经隐藏接口反射取得；
+     * - 可写性一律以「真实创建探针文件」为准，canWrite() 在可移动 FUSE 上会误报；
+     * - 并入 getExternalFilesDirs() 返回的各卷 App 私有目录（系统保证可写、免 SAF/免授权）；
+     * - Android 11 起可移动卷根即使持有 MANAGE_EXTERNAL_STORAGE 通常仍不可裸写（平台限制），
+     *   此时该卷 writable=false，viewer 据此提示改用 SAF 一次性授权。
+     */
+    private fun writeStorageVolumes(socket: Socket) {
+        val array = org.json.JSONArray()
+        try {
+            val seen = LinkedHashSet<String>()
+
+            fun addVolume(dir: File?, removable: Boolean) {
+                if (dir == null) return
+                val path = try { dir.canonicalPath } catch (_: Exception) { dir.absolutePath }
+                if (!FsUsbRecordStore.isAllowedBasePath(path)) return
+                if (!seen.add(path)) return
+                val exists = dir.exists() && dir.isDirectory
+                val obj = org.json.JSONObject()
+                    .put("path", path)
+                    .put("name", dir.name)
+                    .put("removable", removable)
+                if (exists) {
+                    obj.put("writable", probeWritable(dir))
+                    runCatching {
+                        val stat = android.os.StatFs(path)
+                        obj.put("totalBytes", stat.totalBytes)
+                        obj.put("availableBytes", stat.availableBytes)
+                    }
+                } else {
+                    obj.put("writable", false)
+                }
+                array.put(obj)
+            }
+
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                runCatching {
+                    val sm = appContext.getSystemService(android.content.Context.STORAGE_SERVICE)
+                        as android.os.storage.StorageManager
+                    sm.storageVolumes.forEach { vol ->
+                        // getPathFile 为隐藏接口，反射取得该卷在当前用户下的挂载 File。
+                        val root = runCatching {
+                            val m = vol.javaClass.getMethod("getPathFile")
+                            m.isAccessible = true
+                            m.invoke(vol) as? File
+                        }.getOrNull()
+                        val removable = runCatching {
+                            vol.javaClass.getMethod("isRemovable").invoke(vol) as? Boolean
+                        }.getOrNull() ?: false
+                        addVolume(root, removable)
+                    }
+                }
+            } else {
+                // API<24 回退：直接扫描 /storage。
+                File("/storage").listFiles()?.forEach {
+                    if (it.isDirectory) addVolume(it, it.name != "emulated" && it.name != "self")
+                }
+            }
+        } catch (e: Exception) {
+            writeJsonResponse(socket, 500, "Internal Server Error",
+                org.json.JSONObject().put("ok", false)
+                    .put("error", e.message ?: "list volumes failed").toString())
+            return
+        }
+        writeJsonResponse(socket, 200, "OK",
+            org.json.JSONObject().put("ok", true).put("volumes", array).toString())
+    }
+
+    /**
+     * 在目标目录实际创建并删除一个探针文件，验证裸路径在当前 ROM 上确实可写
+     *（仅靠 canWrite() 在部分可移动存储上会误报）。探针残留会被兜底删除，不污染录像目录。
+     */
+    private fun probeWritable(dir: java.io.File): Boolean {
+        return try {
+            if (!dir.exists() || !dir.isDirectory) return false
+            val probe = java.io.File(dir, ".workday_write_test_${System.currentTimeMillis()}")
+            val created = probe.createNewFile()
+            if (created) {
+                probe.outputStream().use { it.write(1) }
+            }
+            val ok = created && probe.exists() && probe.length() >= 0L
+            probe.delete()
+            ok
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** NAS 录像目录已占用字节数；列目录失败返回 null。 */
+    private fun nasUsedBytes(ctx: android.content.Context): Long? {
+        return try {
+            val client = WebDavClient(
+                MeSettings.getWebDavUrl(ctx),
+                MeSettings.getWebDavUsername(ctx),
+                MeSettings.getWebDavPassword(ctx)
+            )
+            client.list(MeSettings.getWebDavDir(ctx))
+                .filter { !it.isDirectory }
+                .sumOf { it.size }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * NAS 统计（PROPFIND 列表）在后台线程执行，最多等 [waitMs] 毫秒：
+     * NAS 不可达时 WebDAV 连接超时很长，绝不能拖住 /cam/storage 整个请求，
+     * 否则 viewer 读超时会认为「后台不支持存储设置」，把存储分区整个藏掉。
+     */
+    private fun nasUsedBytesAsync(ctx: android.content.Context, waitMs: Long = 4000): Long? {
+        val holder = arrayOfNulls<Long>(1)
+        val t = Thread {
+            holder[0] = nasUsedBytes(ctx)
+        }
+        t.isDaemon = true
+        t.start()
+        return try {
+            t.join(waitMs)
+            holder[0]
+        } catch (_: InterruptedException) {
+            null
+        }
+    }
+
+    /**
+     * 保存存储配置：USB 开关、配额方式（保留可用空间/占用上限）与各阈值，
+     * 以及 NAS（WebDAV）地址/账号/密码/目录（支持无屏设备在 viewer 上远程配置）。
+     * 密码字段留空表示「不修改原密码」；传入特殊值可按需清空（viewer 不暴露清空入口）。
+     */
+    private fun applyCameraStorage(socket: Socket, request: HttpRequest) {
+        try {
+            val root = readJsonBody(socket, request) ?: return
+            val ctx = appContext
+
+            // ---- NAS（WebDAV）远程配置 ----
+            // 仅当字段存在时才更新，避免旧客户端缺字段时误清空。
+            if (root.has("nasUrl")) {
+                val url = root.getString("nasUrl").trim().trimEnd('/')
+                // 允许清空（传空串）以停用 NAS；非空时做最基本的协议校验。
+                if (url.isNotEmpty() && !url.startsWith("http://") && !url.startsWith("https://")) {
+                    writeJsonResponse(socket, 400, "Bad Request",
+                        org.json.JSONObject().put("ok", false)
+                            .put("error", "NAS 地址需以 http:// 或 https:// 开头").toString())
+                    return
+                }
+                MeSettings.setWebDavUrl(ctx, url)
+            }
+            if (root.has("nasUsername")) {
+                MeSettings.setWebDavUsername(ctx, root.getString("nasUsername"))
+            }
+            if (root.has("nasPassword")) {
+                // 留空 = 保持原密码不变，避免每次保存表单都把密码覆盖成空。
+                val password = root.getString("nasPassword")
+                if (password.isNotEmpty()) {
+                    MeSettings.setWebDavPassword(ctx, password)
+                }
+            }
+            if (root.has("nasDir")) {
+                MeSettings.setWebDavDir(ctx, root.getString("nasDir"))
+            }
+
+            if (root.has("usbEnabled")) {
+                MeSettings.setUsbRecordEnabled(ctx, root.getBoolean("usbEnabled"))
+            }
+            // 远程指定 USB 真实目录（免 SAF 授权）。传空串表示清除、回退到未配置。
+            if (root.has("usbFsPath")) {
+                val fsPath = root.getString("usbFsPath").trim().trimEnd('/')
+                if (fsPath.isNotEmpty()) {
+                    if (!FsUsbRecordStore.isAllowedBasePath(fsPath)) {
+                        writeJsonResponse(socket, 400, "Bad Request",
+                            org.json.JSONObject().put("ok", false)
+                                .put("error", "目录必须位于 /storage 下的外部存储").toString())
+                        return
+                    }
+                    val store = FsUsbRecordStore(fsPath)
+                    // 保存即实测：建目录并写一个探针文件，确保无屏设备保存后真的能录像。
+                    if (!store.ensureDirectory() || !probeWritable(java.io.File(fsPath))) {
+                        writeJsonResponse(socket, 200, "OK",
+                            org.json.JSONObject().put("ok", false)
+                                .put("error", "目录不可写：请确认 U 盘已插入且路径正确（$fsPath）")
+                                .toString())
+                        return
+                    }
+                }
+                MeSettings.setUsbRecordFsPath(ctx, fsPath)
+            }
+            if (root.has("quotaMode")) {
+                MeSettings.setQuotaMode(ctx, if (root.getInt("quotaMode") == 1) 1 else 0)
+            }
+            if (root.has("reserveMb")) {
+                // 下限 100MB：留得太小起不到保护作用；上限 100GB 防止误输入
+                MeSettings.setQuotaReserveMb(ctx, root.getInt("reserveMb").coerceIn(100, 102400))
+            }
+            if (root.has("limitMb")) {
+                MeSettings.setQuotaLimitMb(ctx, root.getInt("limitMb").coerceIn(100, 1024000))
+            }
+            if (root.has("localCacheMb")) {
+                MeSettings.setLocalCacheMb(ctx, root.getInt("localCacheMb").coerceIn(100, 102400))
+            }
+
+            writeJsonResponse(socket, 200, "OK",
+                org.json.JSONObject().put("ok", true).toString())
+            // USB 开关变化后立即让投递器按新配置补传/停传，无需重启摄像头服务
+            onStorageSettingsChanged?.invoke()
+        } catch (e: Exception) {
+            writeJsonResponse(socket, 400, "Bad Request",
+                org.json.JSONObject().put("ok", false)
+                    .put("error", e.message ?: "bad json").toString())
+        }
+    }
+
     private fun handleRecordingRoute(
         socket: Socket,
         request: HttpRequest,
@@ -1370,18 +1976,29 @@ internal class CameraHttpServer(
         }
         val array = org.json.JSONArray()
         access.listRecordings().forEach { info ->
-            array.put(
-                org.json.JSONObject()
-                    .put("name", info.name)
-                    .put("size", info.size)
-                    .put("time", info.timestampMs)
-                    .put("local", info.local)
-            )
+            val item = org.json.JSONObject()
+                .put("name", info.name)
+                .put("size", info.size)
+                .put("time", info.timestampMs)
+                .put("local", info.local)
+            if (info.motion.isNotEmpty()) {
+                val motion = org.json.JSONArray()
+                info.motion.forEach { range ->
+                    motion.put(
+                        org.json.JSONArray()
+                            .put(info.timestampMs + range[0])
+                            .put(info.timestampMs + range[1])
+                    )
+                }
+                item.put("motion", motion)
+            }
+            array.put(item)
         }
         val body = array.toString().toByteArray(HTML_CHARSET)
         val header = "HTTP/1.0 200 OK\r\n" +
             "Connection: close\r\n" +
             "Cache-Control: no-cache, no-store\r\n" +
+            "X-App-Version: ${BuildConfig.VERSION_NAME}\r\n" +
             "Content-Type: application/json; charset=utf-8\r\n" +
             "Content-Length: ${body.size}\r\n\r\n"
         val output = socket.getOutputStream()
@@ -1454,7 +2071,7 @@ internal class CameraHttpServer(
                     "Content-Type: video/mp4\r\n" +
                     "Accept-Ranges: bytes\r\n" +
                     "Content-Disposition: $disposition; filename=\"$name\"\r\n" +
-                    "Content-Range: bytes $start-$end/${length - 1}\r\n" +
+                    "Content-Range: bytes $start-$end/$length\r\n" +
                     "Content-Length: $contentLength\r\n\r\n"
                 output.write(header.toByteArray(HTTP_CHARSET))
                 copyStream(raf, output, start, contentLength)
@@ -1556,8 +2173,16 @@ internal class CameraHttpServer(
         return start to end
     }
 
-    private fun writeRecordingsPage(socket: Socket) {
-        val body = RECORDINGS_PAGE.toByteArray(HTML_CHARSET)
+    /** 合并页：实时画面与录像回放在同一窗口用页签切换。defaultTab 为 "live" 或 "rec"。 */
+    private fun serveCombined(socket: Socket, defaultTab: String) {
+        var page = COMBINED_PAGE
+        if (meBgCamCtrl.enabled && defaultTab == "live") {
+            page = page.replace("</body>", "${meBgCamCtrl.playerUi()}\n</body>")
+        }
+        page = injectBanner(page)
+            .replace("__DEFAULT_TAB__", defaultTab)
+            .replace("__RECORD_ROTATION__", recordRotation.toString())
+        val body = page.toByteArray(HTML_CHARSET)
         val header = "HTTP/1.0 200 OK\r\n" +
             "Connection: close\r\n" +
             "Cache-Control: no-cache, no-store\r\n" +
@@ -1569,22 +2194,12 @@ internal class CameraHttpServer(
         output.flush()
     }
 
+    private fun writeRecordingsPage(socket: Socket) {
+        serveCombined(socket, "rec")
+    }
+
     private fun writePlayerPage(socket: Socket) {
-        val page = if (meBgCamCtrl.enabled) {
-            PLAYER_PAGE.replace("</body>", "${meBgCamCtrl.playerUi()}\n</body>")
-        } else {
-            PLAYER_PAGE
-        }
-        val body = page.toByteArray(HTML_CHARSET)
-        val header = "HTTP/1.0 200 OK\r\n" +
-            "Connection: close\r\n" +
-            "Cache-Control: no-cache, no-store\r\n" +
-            "Content-Type: text/html; charset=utf-8\r\n" +
-            "Content-Length: ${body.size}\r\n\r\n"
-        val output = socket.getOutputStream()
-        output.write(header.toByteArray(HTTP_CHARSET))
-        output.write(body)
-        output.flush()
+        serveCombined(socket, "live")
     }
 
     private fun writeEmptyResponse(socket: Socket, status: Int, reason: String) {
@@ -1649,28 +2264,73 @@ internal class CameraHttpServer(
         }
     }
 
-    private val PLAYER_PAGE = """
+    private val COMBINED_PAGE = """
 <!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>咩IP摄像头</title>
+<title>咩IP摄像头 · 监控与回放</title>
 <style>
-*{box-sizing:border-box}body{font-family:sans-serif;max-width:1100px;margin:0 auto;padding:16px;background:#000;color:#eee}
-#controls{display:flex;flex-wrap:wrap;gap:8px;align-items:end}.field{display:flex;flex:1 1 180px;min-width:0;flex-direction:column;gap:4px;font-size:14px;color:#bbb}
-input,button{width:100%;min-height:42px;font:inherit;font-size:16px;padding:8px 10px;border:1px solid #555;border-radius:4px}input{background:#222;color:#eee}
-button{flex:0 1 110px;cursor:pointer;background:#333;color:#eee}button[type=submit]{background:#1769aa;border-color:#278bd2}
+*{box-sizing:border-box}body{font-family:sans-serif;max-width:1100px;margin:0 auto;padding:16px;background:#0d1117;color:#eee}
+.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.bar input{flex:1 1 140px;min-width:0;min-height:42px;font-size:16px;padding:8px 10px;border:1px solid #555;border-radius:6px;background:#161b22;color:#eee}
+.bar button{flex:0 0 auto;min-height:42px;padding:8px 14px;font-size:16px;border:1px solid #278bd2;border-radius:6px;background:#1769aa;color:#fff;cursor:pointer}
+.bar button.ghost{background:#21262d;border-color:#444;color:#eee}
+.bar button.on{background:#1769aa;border-color:#278bd2;color:#fff;font-weight:bold}
+#controls{display:flex;flex-wrap:wrap;gap:8px;align-items:end}
+.field{display:flex;flex:1 1 180px;min-width:0;flex-direction:column;gap:4px;font-size:14px;color:#bbb}
+.field input{width:100%;min-height:42px;font:inherit;font-size:16px;padding:8px 10px;border:1px solid #555;border-radius:4px;background:#222;color:#eee}
+#controls button{width:100%;min-height:42px;font:inherit;font-size:16px;padding:8px 10px;border:1px solid #555;border-radius:4px;flex:0 1 110px;cursor:pointer;background:#333;color:#eee}
+#controls button[type=submit]{background:#1769aa;border-color:#278bd2}
 #modes{display:flex;gap:14px;align-items:center;min-height:42px;padding:0 8px}.mode{display:flex;gap:7px;align-items:center;color:#eee;font-size:16px}.mode input{width:20px;min-height:20px;margin:0;padding:0}
 #videoFrame{width:100%;max-width:100vw;max-height:100vh;aspect-ratio:16/9;margin:16px auto 0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
 video,#mjpeg{display:block;width:100%;height:100%;object-fit:contain;transform-origin:center center}audio{display:block;width:100%;margin-top:12px}
-.status{color:#aaa;margin-top:8px;min-height:1.4em}[hidden]{display:none!important}
-@media (max-width:520px){body{padding:10px}#controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}.field,#modes{grid-column:span 2}button{flex:auto;width:auto}#videoFrame{margin-top:10px}}
+.status{color:#aaa;margin-top:8px;min-height:1.4em}
+button:disabled{opacity:.45;cursor:default}
+h1{font-size:18px;margin:4px 0 12px}
+button{min-height:40px;padding:8px 14px;font-size:15px;border:1px solid #278bd2;border-radius:6px;background:#1769aa;color:#fff;cursor:pointer}
+button.ghost{background:#21262d;border-color:#444}
+#status{margin:10px 0;color:#9aa4b0;min-height:1.2em;font-size:14px}
+#playerWrap{width:100%;background:#000;border-radius:8px;margin-bottom:8px;max-height:60vh;position:relative}
+#player{width:100%;max-height:60vh;display:block;background:#000;border-radius:8px}
+#caption{font-size:13px;color:#8b949e;margin:0 0 8px;word-break:break-all}
+#pcontrols{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+#pcontrols button,#pcontrols select,#pcontrols label.pcb{min-height:36px;padding:6px 12px;font-size:14px;border-radius:6px}
+#pcontrols select{background:#21262d;color:#eee;border:1px solid #444;font-size:14px}
+#pcontrols label.pcb{display:flex;gap:6px;align-items:center;border:1px solid #444;background:#21262d;color:#eee;cursor:pointer;user-select:none}
+#pcontrols button{width:auto;flex:0 0 auto}
+#errBox{margin:0 0 12px;padding:10px 12px;border:1px solid #8a2b2b;background:#2d1414;border-radius:6px;font-size:14px;color:#ffb4b4}
+#errBox a{color:#79b8ff;margin-left:8px}
+ul{list-style:none;margin:0;padding:0}
+li{display:flex;align-items:center;gap:10px;padding:11px 8px;border-bottom:1px solid #21262d}
+li.playing{background:#10233a;outline:1px solid #1f6feb;border-radius:6px}
+.dateHead{font-size:14px;color:#79b8ff;padding:10px 4px 6px;border-bottom:1px solid #30363d;font-weight:bold;cursor:pointer}
+.monthBox,.dayBox{margin:0}
+.monthHead{font-size:16px;color:#e6b450;padding:12px 4px 6px;font-weight:bold;cursor:pointer;border-bottom:1px solid #30363d}
+.dayBox summary::-webkit-details-marker,.monthBox summary::-webkit-details-marker{color:#555}
+details.hideEmpty{display:none}
+.meta{flex:1;min-width:0}.meta .t{font-size:15px;word-break:break-all}.meta .s{font-size:12px;color:#8b949e;margin-top:3px}
+.badge{font-size:11px;padding:1px 6px;border-radius:10px;margin-left:6px}
+.badge.local{background:#1769aa}.badge.nas{background:#5a3e00;color:#ffc76b}.badge.cam{background:#234}
+.act{display:flex;gap:8px;flex-shrink:0}.act a,.act button{min-height:36px;padding:6px 12px;font-size:14px;text-decoration:none;border-radius:6px}
+.act a{border:1px solid #444;color:#eee;background:#21262d}
+.act button{width:auto;flex:0 0 auto}
+[hidden]{display:none!important}
+@media (max-width:520px){body{padding:10px}#controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}.field,#modes{grid-column:span 2}#controls button{flex:auto;width:auto}#videoFrame{margin-top:10px}}
 </style>
 </head>
 <body>
+__LANINFO__
+<div class="bar">
+<input id="password" type="text" autocomplete="off" placeholder="访问密码（无密码可留空）">
+<button id="tabLive" type="button" class="ghost">实时画面</button>
+<button id="tabRec" type="button" class="ghost">录像回放</button>
+<input id="filter" type="text" autocomplete="off" placeholder="筛选录像：如 10-15 或 c1" hidden>
+<button id="refresh" type="button" class="ghost" hidden>刷新</button>
+</div>
+<div id="livePane">
 <form id="controls">
-<label class="field">密码 <input id="password" type="text" autocomplete="off"></label>
 <label class="field">摄像头 <input id="camera" type="number" min="1" value="1"></label>
 <label class="field">分辨率档位 <input id="resolution" type="number" min="1" placeholder="自动"></label>
 <div id="modes">
@@ -1679,19 +2339,44 @@ video,#mjpeg{display:block;width:100%;height:100%;object-fit:contain;transform-o
 </div>
 <button id="playStop" type="submit">播放</button>
 <button id="rotate" type="button" aria-label="旋转画面">旋转 0°</button>
-<a href="/recordings" style="flex:0 1 110px;min-height:42px;display:flex;align-items:center;justify-content:center;border:1px solid #278bd2;border-radius:4px;background:#1769aa;color:#eee;text-decoration:none;font-size:16px">录像</a>
 </form>
 <div id="videoFrame"><video id="video" controls autoplay muted playsinline></video></div>
 <div id="videoStatus" class="status"></div>
 <audio id="audio" controls autoplay></audio>
 <div id="audioStatus" class="status"></div>
+</div>
+<div id="recPane" hidden>
+<h1>监控录像</h1>
+<div id="status"></div>
+<div id="playerWrap" hidden><video id="player" controls playsinline></video></div>
+<div id="caption" hidden></div>
+<div id="pcontrols" hidden>
+<button id="prevBtn" class="ghost" title="上一段">⏮ 上一个</button>
+<button id="nextBtn" class="ghost" title="下一段">下一个 ⏭</button>
+<select id="rateSel" title="播放速度">
+<option value="0.5">0.5×</option>
+<option value="1" selected>1×</option>
+<option value="1.25">1.25×</option>
+<option value="1.5">1.5×</option>
+<option value="2">2×</option>
+<option value="4">4×</option>
+</select>
+<button id="shotBtn" class="ghost" title="截取当前画面">📷 截图</button>
+<button id="fsBtn" class="ghost" title="全屏播放">⛶ 全屏</button>
+<label class="pcb" title="播完自动跳下一段"><input id="autoNext" type="checkbox" checked>自动连播</label>
+<button id="closeBtn" class="ghost" title="关闭播放器">✕ 关闭</button>
+</div>
+<div id="errBox" hidden></div>
+<div id="list"></div>
+</div>
 <script>
+var RECORD_ROTATION=__RECORD_ROTATION__;
 const video=document.getElementById('video'),audio=document.getElementById('audio');
 const videoFrame=document.getElementById('videoFrame'),form=document.getElementById('controls');
 const playStopButton=document.getElementById('playStop'),rotateButton=document.getElementById('rotate');
 const videoStatus=document.getElementById('videoStatus'),audioStatus=document.getElementById('audioStatus');
 const playVideo=document.getElementById('playVideo'),playAudio=document.getElementById('playAudio');
-let runId=0,rotation=0,playbackActive=false,mjpegImage=null;
+let runId=0,rotation=RECORD_ROTATION,playbackActive=false,mjpegImage=null;
 let videoAbort=null,videoRetry=null,videoUrl=null,audioAbort=null,audioRetry=null,audioUrl=null;
 function setVideoStatus(value){videoStatus.textContent=value;}
 function setAudioStatus(value){audioStatus.textContent=value;}
@@ -1823,102 +2508,180 @@ try{
   if(savedVideo!==null)playVideo.checked=savedVideo==='true';if(savedAudio!==null)playAudio.checked=savedAudio==='true';
 }catch(error){}
 updateVideoShape();
-</script>
-</body>
-</html>
-"""
-
-    private val RECORDINGS_PAGE = """
-<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>咩监控录像</title>
-<style>
-*{box-sizing:border-box}body{font-family:sans-serif;margin:0 auto;max-width:760px;padding:12px;background:#0d1117;color:#eee}
-h1{font-size:18px;margin:4px 0 12px}
-.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.bar input{flex:1 1 140px;min-width:0;min-height:42px;font-size:16px;padding:8px 10px;border:1px solid #555;border-radius:6px;background:#161b22;color:#eee}
-button{min-height:40px;padding:8px 14px;font-size:15px;border:1px solid #278bd2;border-radius:6px;background:#1769aa;color:#fff;cursor:pointer}
-button.ghost{background:#21262d;border-color:#444}
-#status{margin:10px 0;color:#9aa4b0;min-height:1.2em;font-size:14px}
-#player{width:100%;background:#000;border-radius:8px;margin-bottom:12px;max-height:60vh}
-ul{list-style:none;margin:0;padding:0}
-li{display:flex;align-items:center;gap:10px;padding:11px 8px;border-bottom:1px solid #21262d}
-.meta{flex:1;min-width:0}.meta .t{font-size:15px;word-break:break-all}.meta .s{font-size:12px;color:#8b949e;margin-top:3px}
-.badge{font-size:11px;padding:1px 6px;border-radius:10px;margin-left:6px}
-.badge.local{background:#1769aa}.badge.nas{background:#5a3e00;color:#ffc76b}
-.act{display:flex;gap:8px;flex-shrink:0}.act a,.act button{min-height:36px;padding:6px 12px;font-size:14px;text-decoration:none;border-radius:6px}
-.act a{border:1px solid #444;color:#eee;background:#21262d}
-[hidden]{display:none!important}
-</style>
-</head>
-<body>
-<h1>监控录像</h1>
-<div class="bar">
-<input id="password" type="text" autocomplete="off" placeholder="访问密码（无密码可留空）">
-<button id="load">加载录像</button>
-<button id="refresh" class="ghost">刷新</button>
-<button id="live" class="ghost">看实时</button>
-</div>
-<div id="status"></div>
-<video id="player" controls playsinline hidden></video>
-<ul id="list"></ul>
-<script>
 var passwordInput=document.getElementById('password'),statusNode=document.getElementById('status');
 var listNode=document.getElementById('list'),player=document.getElementById('player');
+var wrapNode=document.getElementById('playerWrap'),capNode=document.getElementById('caption');
+var pcNode=document.getElementById('pcontrols'),errNode=document.getElementById('errBox');
+var rateSel=document.getElementById('rateSel'),autoNextBox=document.getElementById('autoNext');
+var prevBtn=document.getElementById('prevBtn'),nextBtn=document.getElementById('nextBtn');
+var allItems=[],curIndex=-1,recLoaded=false;
 function apiPrefix(){var p=passwordInput.value.trim().replace(/^\/+|\/+$/g,'');return p?encodeURIComponent(p)+'/':'';}
 function setStatus(text){statusNode.textContent=text||'';}
 function formatSize(bytes){if(!bytes)return '0 B';var u=['B','KB','MB','GB'],i=Math.min(u.length-1,Math.floor(Math.log(bytes)/Math.log(1024)));return (bytes/Math.pow(1024,i)).toFixed(i?1:0)+' '+u[i];}
 function formatTime(ms){try{return new Date(ms).toLocaleString();}catch(e){return String(ms);}}
-function stopPlay(){player.pause();player.removeAttribute('src');player.load();player.hidden=true;}
-function playItem(name){
-  var url=apiPrefix()+'rec/file/'+encodeURIComponent(name);
-  player.hidden=false;player.src=url;player.load();
-  try{player.play();}catch(e){}
-  player.scrollIntoView({behavior:'smooth',block:'center'});
+function pad2(n){return (n<10?'0':'')+n;}
+function camOf(name){var m=/^rec_[0-9]{8}-[0-9]{6}_c([0-9]+)\.mp4/i.exec(name||'');return m?('摄像头 '+m[1]):'';}
+function errText(){try{var c=player.error&&player.error.code;return c===1?'加载被中止':c===2?'网络错误，拉取录像失败':c===3?'解码错误，浏览器无法解码这段视频':c===4?'格式不支持或文件损坏':'未知错误('+(player.error?player.error.code:'?')+')';}catch(e){return '播放失败';}}
+function clearErr(){errNode.hidden=true;errNode.innerHTML='';}
+function showErr(){var name=curIndex>=0?allItems[curIndex].name:'';errNode.hidden=false;
+ errNode.textContent='回放失败：'+errText()+'。';
+ var a=document.createElement('a');a.textContent='点击下载到本地播放';a.href=apiPrefix()+'rec/file/'+encodeURIComponent(name)+'?download=1';a.setAttribute('download',name);
+ errNode.appendChild(a);}
+function showPlayer(){wrapNode.hidden=false;capNode.hidden=false;pcNode.hidden=false;}
+function stopPlay(){player.pause();player.removeAttribute('src');player.load();wrapNode.hidden=true;capNode.hidden=true;pcNode.hidden=true;curIndex=-1;clearErr();highlight();}
+function highlight(){var lis=listNode.querySelectorAll('li.rec');for(var i=0;i<lis.length;i++){lis[i].className=lis[i].className.replace(/\bplaying\b/g,'').replace(/^\s+|\s+$/g,'');}
+ if(curIndex>=0){var n=listNode.querySelector('li[data-idx="'+curIndex+'"]');if(n){n.className=(n.className?n.className+' ':'')+'playing';}}}
+function updateNav(){prevBtn.disabled=curIndex<=0;nextBtn.disabled=curIndex<0||curIndex>=allItems.length-1;}
+function playIndex(idx){
+ if(idx<0||idx>=allItems.length)return;
+ curIndex=idx;clearErr();
+ var item=allItems[idx],url=apiPrefix()+'rec/file/'+encodeURIComponent(item.name);
+ capNode.textContent='正在播放：'+item.name+'（'+formatTime(item.time)+'）';
+ showPlayer();highlight();updateNav();
+ player.src=url;player.load();player.playbackRate=Number(rateSel.value)||1;
+ var p=player.play();if(p&&p.catch)p.catch(function(){});
+ try{wrapNode.scrollIntoView({behavior:'smooth',block:'nearest'});}catch(e){}
+}
+function playItem(name){for(var i=0;i<allItems.length;i++){if(allItems[i].name===name){playIndex(i);return;}}}
+player.addEventListener('ended',function(){if(autoNextBox.checked){playIndex(curIndex+1);}});
+player.addEventListener('error',function(){if(player.getAttribute('src'))showErr();});
+rateSel.addEventListener('change',function(){player.playbackRate=Number(rateSel.value)||1;});
+prevBtn.addEventListener('click',function(){playIndex(curIndex-1);});
+nextBtn.addEventListener('click',function(){playIndex(curIndex+1);});
+document.getElementById('closeBtn').addEventListener('click',function(){stopPlay();});
+document.getElementById('fsBtn').addEventListener('click',function(){
+ if(document.fullscreenElement){document.exitFullscreen();return;}
+ var el=wrapNode;if(el.requestFullscreen)el.requestFullscreen();else if(el.webkitRequestFullscreen)el.webkitRequestFullscreen();});
+document.getElementById('shotBtn').addEventListener('click',function(){
+ if(!player.videoWidth){setStatus('当前没有画面可截取');return;}
+ var c=document.createElement('canvas');c.width=player.videoWidth;c.height=player.videoHeight;
+ c.getContext('2d').drawImage(player,0,0,c.width,c.height);
+ var base=curIndex>=0?allItems[curIndex].name.replace(/\.mp4/i,''):'snapshot';
+ c.toBlob(function(b){if(!b)return;var a=document.createElement('a');
+  a.href=URL.createObjectURL(b);
+  a.download=base+'_'+pad2(new Date().getHours())+pad2(new Date().getMinutes())+pad2(new Date().getSeconds())+'.png';
+  document.body.appendChild(a);a.click();
+  setTimeout(function(){URL.revokeObjectURL(a.href);a.remove();},1500);},'image/png');});
+document.addEventListener('keydown',function(e){
+ if(wrapNode.hidden||e.target===passwordInput)return;
+ if(e.key==='ArrowLeft'){player.currentTime=Math.max(0,player.currentTime-5);e.preventDefault();}
+ else if(e.key==='ArrowRight'){player.currentTime=Math.min(player.duration||player.currentTime+5,player.currentTime+5);e.preventDefault();}});
+function buildItem(item,idx,d){
+  var li=document.createElement('li');li.className='rec';li.setAttribute('data-idx',idx);
+  var meta=document.createElement('div');meta.className='meta';
+  var t=document.createElement('div');t.className='t';
+  t.textContent=pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds());
+  var badge=document.createElement('span');badge.className='badge '+(item.local?'local':'nas');
+  badge.textContent=item.local?'本机':'NAS';t.appendChild(badge);
+  var cam=camOf(item.name);
+  if(cam){var cb=document.createElement('span');cb.className='badge cam';cb.textContent=cam;t.appendChild(cb);}
+  var s=document.createElement('div');s.className='s';s.textContent=formatSize(item.size)+' · '+item.name;
+  meta.appendChild(t);meta.appendChild(s);
+  var act=document.createElement('div');act.className='act';
+  var playBtn=document.createElement('button');playBtn.textContent='播放';
+  playBtn.addEventListener('click',function(){playIndex(idx);});
+  var dl=document.createElement('a');dl.textContent='下载';dl.href=apiPrefix()+'rec/file/'+encodeURIComponent(item.name)+'?download=1';
+  dl.setAttribute('download',item.name);
+  act.appendChild(playBtn);act.appendChild(dl);
+  li.appendChild(meta);li.appendChild(act);
+  return li;
 }
 function render(items){
-  listNode.innerHTML='';
-  if(!items.length){setStatus('暂无录像文件');return;}
-  setStatus('共 '+items.length+' 段录像（按时间倒序）');
-  items.forEach(function(item){
-    var li=document.createElement('li');
-    var meta=document.createElement('div');meta.className='meta';
-    var t=document.createElement('div');t.className='t';t.textContent=formatTime(item.time);
-    var badge=document.createElement('span');badge.className='badge '+(item.local?'local':'nas');
-    badge.textContent=item.local?'本机':'NAS';
-    t.appendChild(badge);
-    var s=document.createElement('div');s.className='s';s.textContent=formatSize(item.size)+' · '+item.name;
-    meta.appendChild(t);meta.appendChild(s);
-    var act=document.createElement('div');act.className='act';
-    var playBtn=document.createElement('button');playBtn.textContent='播放';
-    playBtn.addEventListener('click',function(){playItem(item.name);});
-    var dl=document.createElement('a');dl.textContent='下载';dl.href=apiPrefix()+'rec/file/'+encodeURIComponent(item.name)+'?download=1';
-    dl.setAttribute('download',item.name);
-    act.appendChild(playBtn);act.appendChild(dl);
-    li.appendChild(meta);li.appendChild(act);
-    listNode.appendChild(li);
+ listNode.innerHTML='';clearErr();
+ if(!items.length){setStatus('暂无录像文件');return;}
+ items.sort(function(a,b){return (b.time||0)-(a.time||0);});
+ allItems=items;
+ setStatus('共 '+items.length+' 段录像（按月、日分组，点标题展开/收起）');
+ var monthMap={},order=[];
+ items.forEach(function(item,idx){
+  var d=new Date(item.time||0);
+  var mk=d.getFullYear()+'-'+d.getMonth();
+  var dk=mk+'-'+d.getDate();
+  if(!monthMap[mk]){monthMap[mk]={count:0,days:{},dorder:[]};order.push(mk);}
+  var m=monthMap[mk];m.count++;
+  if(!m.days[dk]){m.days[dk]={count:0,items:[]};m.dorder.push(dk);}
+  m.days[dk].count++;m.days[dk].items.push({item:item,idx:idx,d:d});
+ });
+ order.forEach(function(mk,mii){
+  var m=monthMap[mk],parts=mk.split('-'),y=Number(parts[0]),mo=Number(parts[1]);
+  var mdet=document.createElement('details');mdet.className='monthBox';
+  if(mii===0)mdet.open=true;
+  var msum=document.createElement('summary');msum.className='monthHead';
+  msum.textContent=y+' 年 '+(mo+1)+' 月（'+m.count+' 段）';
+  mdet.appendChild(msum);
+  m.dorder.forEach(function(dk,dii){
+   var day=m.days[dk],dom=Number(dk.split('-')[2]);
+   var ddet=document.createElement('details');ddet.className='dayBox';
+   if(mii===0&&dii===0)ddet.open=true;
+   var dsum=document.createElement('summary');dsum.className='dateHead';
+   dsum.textContent=(mo+1)+' 月 '+dom+' 日（'+day.count+' 段）';
+   ddet.appendChild(dsum);
+   day.items.forEach(function(entry){ddet.appendChild(buildItem(entry.item,entry.idx,entry.d));});
+   mdet.appendChild(ddet);
   });
+  listNode.appendChild(mdet);
+ });
+ applyFilter();
 }
+function applyFilter(){
+ var kw=document.getElementById('filter').value.trim().toLowerCase();
+ var anyVisible=false;
+ allItems.forEach(function(item,idx){
+  var n=listNode.querySelector('li[data-idx="'+idx+'"]');if(!n)return;
+  var d=new Date(item.time||0);
+  var hay=(item.name+' '+pad2(d.getMonth()+1)+'-'+pad2(d.getDate())+' '+pad2(d.getHours())+' '+d.getFullYear()).toLowerCase();
+  var show=!kw||hay.indexOf(kw)>=0;
+  n.style.display=show?'':'none';
+  if(show)anyVisible=true;
+ });
+ var boxes=listNode.querySelectorAll('details.dayBox');
+ for(var i=0;i<boxes.length;i++){
+  var vis=false,lis=boxes[i].querySelectorAll('li');
+  for(var j=0;j<lis.length;j++){if(lis[j].style.display!=='none'){vis=true;break;}}
+  boxes[i].className=vis||!kw?'dayBox':'dayBox hideEmpty';
+  if(kw&&vis)boxes[i].open=true;
+ }
+ var months=listNode.querySelectorAll('details.monthBox');
+ for(var k=0;k<months.length;k++){
+  var mv=false,ds=months[k].querySelectorAll('details.dayBox');
+  for(var t=0;t<ds.length;t++){if(ds[t].className.indexOf('hideEmpty')<0){mv=true;break;}}
+  months[k].className=mv||!kw?'monthBox':'monthBox hideEmpty';
+ }
+ if(kw&&!anyVisible)setStatus('没有匹配「'+kw+'」的录像');
+ else setStatus('共 '+allItems.length+' 段录像（按月、日分组）');
+}
+document.getElementById('filter').addEventListener('input',applyFilter);
 function loadList(){
-  stopPlay();setStatus('加载中…');
-  fetch(apiPrefix()+'rec/list',{cache:'no-store'}).then(function(resp){
-    if(resp.status===404){setStatus('密码错误或录像服务不可用');render([]);return null;}
-    if(!resp.ok){setStatus('加载失败：'+resp.status);return null;}
-    return resp.json();
-  }).then(function(items){if(items)render(items);}).catch(function(err){setStatus('加载失败：'+err.message);});
+ stopPlay();setStatus('加载中…');
+ fetch(apiPrefix()+'rec/list',{cache:'no-store'}).then(function(resp){
+  if(resp.status===404){setStatus('密码错误或录像服务不可用');render([]);return null;}
+  if(!resp.ok){setStatus('加载失败：'+resp.status);return null;}
+  return resp.json();
+ }).then(function(items){if(items)render(items);}).catch(function(err){setStatus('加载失败：'+err.message);});
 }
-document.getElementById('load').addEventListener('click',function(){
-  try{localStorage.setItem('recPassword',passwordInput.value);}catch(e){}
-  loadList();
+document.getElementById('refresh').addEventListener('click',function(){
+ try{localStorage.setItem('cameraPassword',passwordInput.value);}catch(e){}
+ loadList();
 });
-document.getElementById('refresh').addEventListener('click',loadList);
-document.getElementById('live').addEventListener('click',function(){window.location.href='/';});
-passwordInput.addEventListener('keydown',function(e){if(e.key==='Enter'){document.getElementById('load').click();}});
-try{var saved=localStorage.getItem('recPassword');if(saved!==null)passwordInput.value=saved;}catch(e){}
-loadList();
+passwordInput.addEventListener('keydown',function(e){
+ if(e.key!=='Enter')return;
+ if(document.getElementById('recPane').hidden){document.getElementById('playStop').click();}
+ else{document.getElementById('refresh').click();}
+});
+function showTab(name){
+ stopPlay();stopPlayback(false);
+ document.getElementById('livePane').hidden=name!=='live';
+ document.getElementById('recPane').hidden=name!=='rec';
+ document.getElementById('filter').hidden=name!=='rec';
+ document.getElementById('refresh').hidden=name!=='rec';
+ document.getElementById('tabLive').className=name==='live'?'on':'ghost';
+ document.getElementById('tabRec').className=name==='rec'?'on':'ghost';
+ if(name==='rec'&&!recLoaded){recLoaded=true;loadList();}
+}
+document.getElementById('tabLive').addEventListener('click',function(){showTab('live');});
+document.getElementById('tabRec').addEventListener('click',function(){showTab('rec');});
+var DEFAULT_TAB='__DEFAULT_TAB__';
+showTab(DEFAULT_TAB==='rec'?'rec':'live');
 </script>
 </body>
 </html>

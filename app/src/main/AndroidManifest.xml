@@ -36,8 +36,11 @@
         </intent>
     </queries>
 
+    <!-- extractNativeLibs=true：libWorkdayAlarmClock.so 实为按文件路径执行的 Go 可执行程序，
+         必须在安装时解压到磁盘；不能用 AGP7.1 默认的 false（so 留 APK 内，sh 执行会 not found） -->
     <application
         android:allowBackup="true"
+        android:extractNativeLibs="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:requestLegacyExternalStorage="true"

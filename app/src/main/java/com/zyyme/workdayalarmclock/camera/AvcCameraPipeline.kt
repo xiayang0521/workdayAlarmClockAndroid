@@ -11,6 +11,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -22,6 +23,7 @@ import android.os.SystemClock
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import com.zyyme.workdayalarmclock.MeSettings
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
@@ -38,10 +40,9 @@ internal class AvcCameraPipeline(
     private val log: (String) -> Unit
 ) : CameraStreamPipeline {
     companion object {
-        private const val TARGET_FPS = 30
-        private const val MAX_PREFERRED_WIDTH = 2048
         private const val START_TIMEOUT_SECONDS = 10L
-        private val START_CODE = byteArrayOf(0, 0, 0, 1)
+        private const val ANALYSIS_WIDTH = 320
+        private const val ANALYSIS_HEIGHT = 240
 
         private data class CameraTarget(
             val logicalCameraId: String,
@@ -98,19 +99,45 @@ internal class AvcCameraPipeline(
     private val codecConfigMonitor = Object()
 
     private var avcStreamConfig: AvcStreamConfig? = null
+    @Volatile private var annexbNative = false
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var codec: MediaCodec? = null
     private var codecSurface: Surface? = null
+    private var overlayRenderer: OverlayRenderer? = null
+    private var cameraTargetSurface: Surface? = null
     private var drainThread: Thread? = null
     private var selectedWidth = 0
     private var selectedHeight = 0
     private var selectedFps = 0
+    private var analysisReader: ImageReader? = null
+    private var motionDetector: MotionDetector? = null
+    private var baseBitrate = 0
+
+    /** 实际使用的编码类型：选择 H.265 但设备不支持时自动退回 H.264。 */
+    @Volatile private var codecMime: String = MediaFormat.MIMETYPE_VIDEO_AVC
+
+    /** 按设置创建编码器；H.265 创建失败时降级到 H.264 并提示。 */
+    private fun createEncoder(): MediaCodec {
+        val wantHevc = MeSettings.getRecordCodec(context) == MeSettings.CODEC_H265 &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP
+        if (wantHevc) {
+            try {
+                val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC)
+                codecMime = MediaFormat.MIMETYPE_VIDEO_HEVC
+                return encoder
+            } catch (e: Exception) {
+                log("本机不支持 H.265(HEVC) 硬件编码，已自动改用 H.264：${e.message}")
+            }
+        }
+        codecMime = MediaFormat.MIMETYPE_VIDEO_AVC
+        return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    }
 
     override val description: String
-        get() = "H.264 ${selectedWidth}x${selectedHeight} ${selectedFps}fps"
+        get() = "${if (codecMime == MediaFormat.MIMETYPE_VIDEO_HEVC) "H.265" else "H.264"} ${selectedWidth}x${selectedHeight} ${selectedFps}fps"
 
     @SuppressLint("MissingPermission")
     override fun start(): Boolean {
@@ -121,13 +148,33 @@ internal class AvcCameraPipeline(
             cameraHandler = Handler(cameraThread!!.looper)
 
             val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val encoder = createEncoder()
             codec = encoder
             val selection = selectConfiguration(cameraManager, encoder)
-                ?: throw IllegalStateException("没有可用的H.264输出规格")
+                ?: throw IllegalStateException("没有可用的编码输出规格")
             selectedWidth = selection.size.width
             selectedHeight = selection.size.height
             selectedFps = selection.fps
+
+            // 静止检测分析流：仅在启用抽帧/低码率策略时创建
+            if (MeSettings.getRecordStaticPolicy(context) != MeSettings.STATIC_POLICY_ALL) {
+                try {
+                    val reader = ImageReader.newInstance(
+                        ANALYSIS_WIDTH, ANALYSIS_HEIGHT, ImageFormat.YUV_420_888, 2
+                    )
+                    analysisReader = reader
+                    motionDetector = MotionDetector(
+                        reader,
+                        MeSettings.motionThresholdRatio(context)
+                    ) { moving ->
+                        log(if (moving) "画面变动，恢复正常录像" else "画面静止，进入省空间录像")
+                    }
+                } catch (e: Exception) {
+                    log("静止检测初始化失败：${e.message}")
+                    analysisReader = null
+                    motionDetector = null
+                }
+            }
 
             encoder.configure(
                 createEncoderFormat(),
@@ -136,6 +183,26 @@ internal class AvcCameraPipeline(
                 MediaCodec.CONFIGURE_FLAG_ENCODE
             )
             codecSurface = encoder.createInputSurface()
+            // 录像画面时间水印：GL 叠加"日期时间+移动/静止"标签；失败自动降级为无水印直连接
+            try {
+                val renderer = OverlayRenderer(
+                    codecSurface!!, selectedWidth, selectedHeight,
+                    MeSettings.getRecordRotation(context)
+                ) {
+                    motionDetector?.isMoving ?: true
+                }
+                overlayRenderer = renderer
+                cameraTargetSurface = renderer.cameraSurface() ?: codecSurface
+                if (renderer.cameraSurface() == null) {
+                    log("时间水印初始化失败，使用无水印模式")
+                } else {
+                    log("录像时间水印已开启")
+                }
+            } catch (e: Exception) {
+                log("时间水印初始化失败，使用无水印模式：${e.message}")
+                overlayRenderer = null
+                cameraTargetSurface = codecSurface
+            }
             encoder.start()
             startDrainThread(encoder)
 
@@ -145,7 +212,7 @@ internal class AvcCameraPipeline(
                 cameraHandler
             )
         } catch (e: Exception) {
-            log("H.264摄像头启动失败：${e.message}")
+            log("${if (codecMime == MediaFormat.MIMETYPE_VIDEO_HEVC) "H.265" else "H.264"}摄像头启动失败：${e.message}")
             resolveStart(false)
         }
 
@@ -166,6 +233,7 @@ internal class AvcCameraPipeline(
         encoder: MediaCodec
     ): Selection? {
         val target = enumerateTargets(cameraManager).getOrNull(key.cameraIndex) ?: return null
+        val targetFps = MeSettings.getRecordFps(context)
         val characteristics = cameraManager.getCameraCharacteristics(
             target.physicalCameraId ?: target.logicalCameraId
         )
@@ -178,9 +246,7 @@ internal class AvcCameraPipeline(
         val sizes = streamMap.getOutputSizes(ImageFormat.PRIVATE)?.toList().orEmpty()
         if (sizes.isEmpty()) return null
 
-        val codecCapabilities = encoder.codecInfo.getCapabilitiesForType(
-            MediaFormat.MIMETYPE_VIDEO_AVC
-        )
+        val codecCapabilities = encoder.codecInfo.getCapabilitiesForType(codecMime)
         if (!codecCapabilities.colorFormats.contains(
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
             )
@@ -189,7 +255,7 @@ internal class AvcCameraPipeline(
         val aeRanges = characteristics.get(
             CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
         ).orEmpty().toList()
-        val targetAeRange = selectFpsRangeContaining(aeRanges, TARGET_FPS)
+        val targetAeRange = selectFpsRangeContaining(aeRanges, targetFps)
 
         val usableSizes = sizes.filter { size ->
             try {
@@ -206,8 +272,9 @@ internal class AvcCameraPipeline(
             targetHeight != null -> selectSizeByTargetHeight(usableSizes, targetHeight)
             resolutionIndex != null -> sortedSizes(usableSizes).getOrNull(resolutionIndex) ?: return null
             else -> {
+            // 默认取摄像头最高像素：优先选择能跑满目标帧率的最大尺寸，
+            // 都不支持目标帧率时退回最大可用尺寸（帧率由后续逻辑自动压低）。
             val preferredSizes = usableSizes.filter { size ->
-                if (size.width > MAX_PREFERRED_WIDTH) return@filter false
                 if (targetAeRange == null) return@filter false
                 val cameraDuration = try {
                     streamMap.getOutputMinFrameDuration(ImageFormat.PRIVATE, size)
@@ -215,12 +282,12 @@ internal class AvcCameraPipeline(
                     0L
                 }
                 val cameraSupportsTarget = cameraDuration <= 0L ||
-                    cameraDuration <= 1_000_000_000L / TARGET_FPS
+                    cameraDuration <= 1_000_000_000L / targetFps
                 val encoderSupportsTarget = try {
                     videoCapabilities.areSizeAndRateSupported(
                         size.width,
                         size.height,
-                        TARGET_FPS.toDouble()
+                        targetFps.toDouble()
                     )
                 } catch (_: Exception) {
                     false
@@ -239,7 +306,7 @@ internal class AvcCameraPipeline(
         val cameraMaxFps = if (cameraDuration > 0L) {
             floor(1_000_000_000.0 / cameraDuration).toInt().coerceAtLeast(1)
         } else {
-            TARGET_FPS
+            targetFps
         }
         val encoderMaxFps = try {
             floor(
@@ -249,9 +316,9 @@ internal class AvcCameraPipeline(
                 ).upper
             ).toInt().coerceAtLeast(1)
         } catch (_: Exception) {
-            TARGET_FPS
+            targetFps
         }
-        val outputFps = min(TARGET_FPS, min(cameraMaxFps, encoderMaxFps)).coerceAtLeast(1)
+        val outputFps = min(targetFps, min(cameraMaxFps, encoderMaxFps)).coerceAtLeast(1)
         val aeRange = selectFpsRange(aeRanges, outputFps)
         val actualFps = min(outputFps, aeRange?.upper ?: outputFps).coerceAtLeast(1)
         return Selection(
@@ -265,7 +332,7 @@ internal class AvcCameraPipeline(
 
     private fun createEncoderFormat(): MediaFormat {
         return MediaFormat.createVideoFormat(
-            MediaFormat.MIMETYPE_VIDEO_AVC,
+            codecMime,
             selectedWidth,
             selectedHeight
         ).apply {
@@ -273,7 +340,8 @@ internal class AvcCameraPipeline(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
             )
-            setInteger(MediaFormat.KEY_BIT_RATE, max(128_000, selectedWidth * selectedHeight * 2))
+            baseBitrate = max(128_000, selectedWidth * selectedHeight * 2)
+            setInteger(MediaFormat.KEY_BIT_RATE, baseBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, selectedFps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
@@ -330,7 +398,7 @@ internal class AvcCameraPipeline(
                     return
                 }
                 cameraDevice = openedCamera
-                val surface = codecSurface
+                val surface = cameraTargetSurface
                 if (surface == null) {
                     resolveStart(false)
                     return
@@ -367,12 +435,15 @@ internal class AvcCameraPipeline(
         selection: Selection
     ) {
         val callback = captureSessionCallback(openedCamera, surface, selection)
+        val analysisSurface = analysisReader?.surface
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
             selection.physicalCameraId != null
         ) {
             val output = OutputConfiguration(surface).apply {
                 setPhysicalCameraId(selection.physicalCameraId)
             }
+            val outputs = mutableListOf(output)
+            if (analysisSurface != null) outputs.add(OutputConfiguration(analysisSurface))
             val executor = Executor { command ->
                 val handler = cameraHandler
                 if (handler != null) handler.post(command) else command.run()
@@ -380,13 +451,16 @@ internal class AvcCameraPipeline(
             openedCamera.createCaptureSession(
                 SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR,
-                    listOf(output),
+                    outputs,
                     executor,
                     callback
                 )
             )
         } else {
-            openedCamera.createCaptureSession(listOf(surface), callback, cameraHandler)
+            val surfaces = mutableListOf(surface)
+            if (analysisSurface != null) surfaces.add(analysisSurface)
+            @Suppress("DEPRECATION")
+            openedCamera.createCaptureSession(surfaces, callback, cameraHandler)
         }
     }
 
@@ -407,6 +481,7 @@ internal class AvcCameraPipeline(
                         CameraDevice.TEMPLATE_RECORD
                     ).apply {
                         addTarget(surface)
+                        analysisReader?.surface?.let { addTarget(it) }
                         set(
                             CaptureRequest.CONTROL_MODE,
                             CaptureRequest.CONTROL_MODE_AUTO
@@ -420,6 +495,7 @@ internal class AvcCameraPipeline(
                     }
                     captureSession = session
                     session.setRepeatingRequest(request.build(), null, cameraHandler)
+                    motionDetector?.start()
                     log("摄像头流已准备：$description")
                     resolveStart(true)
                 } catch (e: Exception) {
@@ -460,7 +536,11 @@ internal class AvcCameraPipeline(
                                 outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
                                 val bytes = ByteArray(bufferInfo.size)
                                 outputBuffer.get(bytes)
-                                val normalized = toAnnexB(bytes)
+                                // 编码器输出形态随厂商而异（AVCC/AnnexB/嵌套/起始码分段内
+                                // 又带长度前缀的混合形态），统一交给 NalUnits 递归展平为
+                                // 干净 AnnexB，供直播与录像共用。早期本地实现不剥段内长度
+                                // 前缀，是录像 L4(L4(IDR)) 黑屏有声的根因，已收敛到此工具。
+                                val normalized = NalUnits.toAnnexB(bytes)
                                 val isConfig = bufferInfo.flags and
                                     MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
                                 if (isConfig) {
@@ -468,7 +548,8 @@ internal class AvcCameraPipeline(
                                 } else {
                                     val keyFrame = bufferInfo.flags and
                                         MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 ||
-                                        containsIdr(normalized)
+                                        (codecMime == MediaFormat.MIMETYPE_VIDEO_AVC &&
+                                            NalUnits.containsAvcIdr(normalized))
                                     frameHub.publish(
                                         normalized,
                                         keyFrame,
@@ -489,17 +570,20 @@ internal class AvcCameraPipeline(
 
     private fun updateCodecConfig(format: MediaFormat) {
         val output = ByteArrayOutputStream()
-        listOf("csd-0", "csd-1").forEach { name ->
+        listOf("csd-0", "csd-1", "csd-2").forEach { name ->
             val buffer = format.getByteBuffer(name) ?: return@forEach
             val duplicate = buffer.duplicate()
             val bytes = ByteArray(duplicate.remaining())
             duplicate.get(bytes)
-            output.write(toAnnexB(bytes))
+            // 配置缓冲自带起始码 = AnnexB 原生栈（系统 MediaMuxer 会自动转 AVCC）。
+            if (hasStartCode(bytes, 0)) annexbNative = true
+            output.write(NalUnits.toAnnexB(bytes))
         }
         updateCodecConfig(output.toByteArray())
     }
 
     private fun updateCodecConfig(annexBConfig: ByteArray) {
+        if (hasStartCode(annexBConfig, 0)) annexbNative = true
         val parsed = FragmentedMp4Muxer.Companion.parseAvcConfig(
             annexBConfig,
             selectedWidth,
@@ -512,32 +596,6 @@ internal class AvcCameraPipeline(
         }
     }
 
-    private fun toAnnexB(data: ByteArray): ByteArray {
-        if (data.isEmpty() || hasStartCode(data, 0)) return data
-
-        val output = ByteArrayOutputStream(data.size + 16)
-        var offset = 0
-        var parsedAny = false
-        while (offset + 4 <= data.size) {
-            val length = ((data[offset].toInt() and 0xff) shl 24) or
-                ((data[offset + 1].toInt() and 0xff) shl 16) or
-                ((data[offset + 2].toInt() and 0xff) shl 8) or
-                (data[offset + 3].toInt() and 0xff)
-            offset += 4
-            if (length <= 0 || offset + length > data.size) {
-                parsedAny = false
-                break
-            }
-            output.write(START_CODE)
-            output.write(data, offset, length)
-            offset += length
-            parsedAny = true
-        }
-        if (parsedAny && offset == data.size) return output.toByteArray()
-
-        return START_CODE + data
-    }
-
     private fun hasStartCode(data: ByteArray, offset: Int): Boolean {
         if (offset + 3 >= data.size) return false
         return data[offset] == 0.toByte() && data[offset + 1] == 0.toByte() &&
@@ -545,33 +603,13 @@ internal class AvcCameraPipeline(
                 (data[offset + 2] == 0.toByte() && data[offset + 3] == 1.toByte()))
     }
 
-    private fun containsIdr(data: ByteArray): Boolean {
-        var index = 0
-        while (index + 4 < data.size) {
-            val startCodeSize = when {
-                index + 3 < data.size && data[index] == 0.toByte() &&
-                    data[index + 1] == 0.toByte() && data[index + 2] == 1.toByte() -> 3
-                index + 4 < data.size && data[index] == 0.toByte() &&
-                    data[index + 1] == 0.toByte() && data[index + 2] == 0.toByte() &&
-                    data[index + 3] == 1.toByte() -> 4
-                else -> 0
-            }
-            if (startCodeSize > 0 && index + startCodeSize < data.size) {
-                if (data[index + startCodeSize].toInt().and(0x1f) == 5) return true
-                index += startCodeSize
-            } else {
-                index++
-            }
-        }
-        return false
-    }
-
     override fun awaitPacket(afterSequence: Long): CameraStreamPacket? {
         return frameHub.awaitNext(afterSequence)
     }
 
-    override fun awaitAvcConfig(timeoutMillis: Long): AvcStreamConfig? {
-        val deadline = SystemClock.elapsedRealtime() + timeoutMillis
+    override fun isAnnexbNative(): Boolean = annexbNative
+
+    override fun awaitAvcConfig(timeoutMillis: Long): AvcStreamConfig? {        val deadline = SystemClock.elapsedRealtime() + timeoutMillis
         synchronized(codecConfigMonitor) {
             while (running.get() && avcStreamConfig == null) {
                 val remaining = deadline - SystemClock.elapsedRealtime()
@@ -595,6 +633,21 @@ internal class AvcCameraPipeline(
         }
     }
 
+    override fun isMoving(): Boolean = motionDetector?.isMoving ?: true
+
+    override fun hasMotionDetection(): Boolean = motionDetector != null
+
+    override fun setDynamicBitrate(bitsPerSecond: Int) {
+        val codec = codec ?: return
+        val target = if (bitsPerSecond > 0) bitsPerSecond else baseBitrate
+        try {
+            codec.setParameters(Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, target)
+            })
+        } catch (_: Exception) {
+        }
+    }
+
     private fun closeStreamAfterRuntimeFailure() {
         running.set(false)
         frameHub.close()
@@ -611,6 +664,14 @@ internal class AvcCameraPipeline(
         synchronized(codecConfigMonitor) {
             codecConfigMonitor.notifyAll()
         }
+
+        motionDetector?.stop()
+        motionDetector = null
+        try {
+            analysisReader?.close()
+        } catch (_: Exception) {
+        }
+        analysisReader = null
 
         try {
             captureSession?.stopRepeating()
@@ -642,6 +703,12 @@ internal class AvcCameraPipeline(
         } catch (_: Exception) {
         }
         codec = null
+        try {
+            overlayRenderer?.release()
+        } catch (_: Exception) {
+        }
+        overlayRenderer = null
+        cameraTargetSurface = null
         try {
             codecSurface?.release()
         } catch (_: Exception) {

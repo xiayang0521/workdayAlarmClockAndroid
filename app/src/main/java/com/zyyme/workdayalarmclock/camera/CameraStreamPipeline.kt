@@ -27,7 +27,11 @@ internal data class AvcStreamConfig(
     val width: Int,
     val height: Int,
     val frameRate: Int,
-    val codecString: String
+    val codecString: String,
+    /** "avc" 或 "hevc"。 */
+    val codec: String = "avc",
+    /** HEVC 视频参数集（AVC 为空）。 */
+    val vps: ByteArray = ByteArray(0)
 )
 
 internal interface CameraStreamPipeline {
@@ -39,6 +43,14 @@ internal interface CameraStreamPipeline {
     fun awaitPacket(afterSequence: Long): CameraStreamPacket?
     fun awaitAvcConfig(timeoutMillis: Long): AvcStreamConfig? = null
     fun requestKeyFrame() = Unit
+    /** 设备栈是否为 AnnexB 原生（见 AvcStreamConfig.annexbNative）。 */
+    fun isAnnexbNative(): Boolean = false
+    /** 画面是否有变动（静止检测结果；无检测能力时恒为 true）。 */
+    fun isMoving(): Boolean = true
+    /** 是否具备静止检测能力（决定是否需要记录动态时间标签）。 */
+    fun hasMotionDetection(): Boolean = false
+    /** 动态调整编码码率（<=0 恢复默认）。 */
+    fun setDynamicBitrate(bitsPerSecond: Int) = Unit
 }
 
 internal class CameraFrameHub(

@@ -3,6 +3,7 @@ package com.zyyme.workdayalarmclock.record
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import com.zyyme.workdayalarmclock.camera.NalUnits
 import java.io.File
 import java.nio.ByteBuffer
 
@@ -16,7 +17,18 @@ internal class RecordingSegmentWriter(
     val file: File,
     private val videoFormat: MediaFormat,
     private val audioFormat: MediaFormat?,
-    private val durationLimitUs: Long
+    private val durationLimitUs: Long,
+    /**
+     * 录像画面旋转角度（0/90/180/270）。通过 muxer.setOrientationHint 写入 MP4
+     * 方向矩阵（须在 addTrack 之前调用），播放器读取矩阵后自动转正画面，
+     * 无需重新编码。摄像头倒挂安装时设为 180 即可。
+     */
+    private val rotationDegrees: Int = 0,
+    /**
+     * 视频是否为 H.265/HEVC。决定打包时剥除哪些参数集（HEVC 是 VPS/SPS/PPS，
+     * AVC 是 SPS/PPS）以及关键帧内容判定方式。默认 false 即 H.264。
+     */
+    private val isHevc: Boolean = false
 ) {
     private val lock = Any()
 
@@ -55,7 +67,27 @@ internal class RecordingSegmentWriter(
             if (!started) return true
             val relativeUs = normalize(presentationTimeUs - videoBaseUs)
             if (relativeUs < 0L) return true
-            writeSample(videoTrack, data, relativeUs, keyFrame)
+            // 关键：录像样本必须喂「AnnexB」，由系统 MediaMuxer 自己完成 AnnexB→AVCC。
+            //
+            // 这台一加/ColorOS 设备的硬编是「AnnexB 原生栈」：管线 publish 的 packet.data
+            // 用 00 00 00 01 起始码分帧，而系统 MediaMuxer.writeSampleData 会把 AnnexB
+            // 规范化成单层 AVCC 再落盘（老版本/原仓库直喂 AnnexB 即产出可正常播放的录像）。
+            //
+            // 曾经的错误做法是在 App 侧先用 NalUnits.toAvccSample 把帧转成 AVCC 再喂给
+            // MediaMuxer；结果系统又包一层长度前缀，落盘样本变成 L4(L4(NAL)) 双前缀，
+            // 解码器逐帧报 "missing picture in access unit"，表现为整段黑屏、只有声音。
+            //
+            // 因此这里只做「归一化成干净 AnnexB」——NalUnits.toAnnexB 会递归剥掉厂商
+            // 可能叠加的长度前缀/混合封装，再统一补回起始码——绝不在 App 侧转 AVCC。
+            // 归一化后一个 NAL 都解不出来就丢帧，绝不把垃圾写进文件。
+            val units = NalUnits.extract(data)
+            if (units.isEmpty()) return true
+            val annexB = NalUnits.toAnnexB(data)
+            // 关键帧标记必须以样本内容为准：上游 keyFrame 标记在部分编码器路径上会与实际
+            // NAL 不一致，导致整段 MP4 一个关键帧都没有，解码器找不到起播锚点而逐帧报
+            // "missing picture"。AVC 直接检测 IDR(type5)；HEVC 关键帧类型不同，沿用上游标记。
+            val effectiveKey = keyFrame || (!isHevc && NalUnits.containsAvcIdr(data))
+            writeSample(videoTrack, annexB, relativeUs, effectiveKey)
             lastVideoUs = relativeUs
             videoFrames++
             return true
@@ -158,6 +190,12 @@ internal class RecordingSegmentWriter(
         if (muxer == null) {
             file.parentFile?.mkdirs()
             muxer = MediaMuxer(partFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            if (rotationDegrees == 90 || rotationDegrees == 180 || rotationDegrees == 270) {
+                try {
+                    muxer!!.setOrientationHint(rotationDegrees)
+                } catch (_: Exception) {
+                }
+            }
         }
     }
 

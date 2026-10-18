@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.AudioManager
+import android.net.Uri
 import android.os.*
 import android.provider.Settings
 import android.support.v4.media.session.MediaSessionCompat
@@ -36,6 +37,7 @@ import kotlin.system.exitProcess
 import androidx.core.net.toUri
 import com.zyyme.workdayalarmclock.applist.AppListActivity
 import com.zyyme.workdayalarmclock.camera.AmbientBrightnessController
+import com.zyyme.workdayalarmclock.nas.NasScanner
 import com.zyyme.workdayalarmclock.nas.WebDavClient
 import com.zyyme.workdayalarmclock.nas.WebDavException
 import com.zyyme.workdayalarmclock.notification.MeNotificationListenerService
@@ -69,6 +71,7 @@ class MainActivity : AppCompatActivity() {
         private const val REQUEST_MEDIA_SERVER_PERMISSIONS = 102
         private const val REQUEST_AMBIENT_CAMERA_PERMISSION = 103
         private const val REQUEST_RECORD_PERMISSIONS = 104
+        private const val REQUEST_USB_TREE = 105
         private const val LOG_REFRESH_DELAY_MILLIS = 250L
         private const val DPAD_CENTER_LONG_PRESS_DELAY_MS = 900L
     }
@@ -86,6 +89,9 @@ class MainActivity : AppCompatActivity() {
     private var settingsPopupMenu: PopupMenu? = null
     private var openAmbientDialogAfterPermission = false
     private var openRecordDialogAfterPermission = false
+    // 录像设置对话框里的 USB 控件，供 SAF 目录选择回调写回；对话框关闭后置空。
+    private var recordDialogUsbPathLabel: TextView? = null
+    private var recordDialogUsbSwitch: Switch? = null
     private var dpadPassthrough = false
     private var dpadCenterLongPressTriggered = false
     private val dpadCenterLongPressRunnable = Runnable {
@@ -666,6 +672,65 @@ class MainActivity : AppCompatActivity() {
         val passwordInput = textInput("WebDAV 密码", MeSettings.getWebDavPassword(this), true)
         container.addView(passwordInput)
 
+        // ===== 局域网 NAS 自动搜索：发现咩存储的 WebDAV 服务，验证通过后填入地址 =====
+        val scanNasButton = android.widget.Button(this).apply {
+            text = "搜索局域网 NAS（自动查找咩存储）"
+        }
+        container.addView(scanNasButton)
+        val scanNasStatus = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, padSmall, 0, 0)
+        }
+        container.addView(scanNasStatus)
+
+        scanNasButton.setOnClickListener {
+            scanNasStatus.text = "正在搜索局域网 NAS（约 5 秒）…"
+            scanNasButton.isEnabled = false
+            NasScanner.scan(this) { candidates ->
+                scanNasButton.isEnabled = true
+                if (candidates.isEmpty()) {
+                    scanNasStatus.text = "未发现 NAS。请确认存储手机已开启 FTP/WebDAV 服务，" +
+                        "且与本机连接同一局域网。"
+                    return@scan
+                }
+                scanNasStatus.text = "发现 ${candidates.size} 个候选，正在验证 WebDAV 连接…"
+                val username = usernameInput.text.toString().trim()
+                val password = passwordInput.text.toString()
+                Thread {
+                    val verified = mutableListOf<NasScanner.Candidate>()
+                    for (c in candidates) {
+                        try {
+                            WebDavClient("http://${c.host}:${c.port}", username, password)
+                                .testConnection()
+                            verified.add(c)
+                        } catch (_: Exception) {
+                            // 验证失败（非 WebDAV 服务或账号密码不对）的候选不列出
+                        }
+                    }
+                    runOnUiThread {
+                        if (verified.isEmpty()) {
+                            scanNasStatus.text =
+                                "发现 ${candidates.size} 个设备，但 WebDAV 验证均未通过，" +
+                                    "请检查上方账号密码后重试。"
+                        } else {
+                            val items = verified.map { it.toString() }.toTypedArray()
+                            AlertDialog.Builder(this)
+                                .setTitle("选择 NAS（已通过 WebDAV 验证）")
+                                .setItems(items) { _, which ->
+                                    val picked = verified[which]
+                                    urlInput.setText(picked.suggestedUrl())
+                                    urlInput.setSelection(urlInput.text.length)
+                                    scanNasStatus.text =
+                                        "已填入 ${picked.suggestedUrl()}，点击「保存」生效"
+                                }
+                                .setNegativeButton("取消", null)
+                                .show()
+                        }
+                    }
+                }.start()
+            }
+        }
+
         container.addView(sectionLabel("录像存放目录（相对地址，可留空存到根目录）"))
         val dirInput = textInput("例如 monitor/recordings", MeSettings.getWebDavDir(this))
         container.addView(dirInput)
@@ -691,6 +756,61 @@ class MainActivity : AppCompatActivity() {
         )
         container.addView(heightGroup)
 
+        container.addView(sectionLabel("画面旋转角度（摄像头倒挂时选 180°，新录制的视频生效）"))
+        val rotationGroup = RadioGroup(this)
+        listOf(0, 90, 180, 270).forEach { angle ->
+            rotationGroup.addView(RadioButton(this).apply {
+                text = angle.toString() + "°"
+                id = 1000 + angle
+            })
+        }
+        rotationGroup.check(1000 + MeSettings.getRecordRotation(this))
+        container.addView(rotationGroup)
+
+        container.addView(sectionLabel("视频编码（影响直播和录像，切换后自动重启摄像头服务）"))
+        val codecGroup = RadioGroup(this)
+        val codecH264 = RadioButton(this).apply { text = "H.264（兼容最好，推荐）"; id = 2000 }
+        val codecH265 = RadioButton(this).apply {
+            text = "H.265 / HEVC（省一半空间，部分旧设备/浏览器放不了）"; id = 2001
+        }
+        codecGroup.addView(codecH264)
+        codecGroup.addView(codecH265)
+        codecGroup.check(if (MeSettings.getRecordCodec(this) == MeSettings.CODEC_H265) 2001 else 2000)
+        container.addView(codecGroup)
+
+        container.addView(sectionLabel("录像帧率（每秒帧数 10~30，默认 20，影响直播和录像，切换后自动重启摄像头服务）"))
+        val fpsGroup = RadioGroup(this)
+        listOf(10, 15, 20, 25, 30).forEach { fps ->
+            fpsGroup.addView(RadioButton(this).apply {
+                text = fps.toString() + " fps"
+                id = 5000 + fps
+            })
+        }
+        fpsGroup.check(5000 + MeSettings.getRecordFps(this))
+        container.addView(fpsGroup)
+
+        container.addView(sectionLabel("画面静止时策略（帧差法检测：每 0.5 秒对比一帧，变动约 1.5 秒触发、静止约 6 秒确认，防灯光频闪误触发）"))
+        val policyGroup = RadioGroup(this)
+        val policyOptions = listOf(
+            MeSettings.STATIC_POLICY_ALL to "全录（不变，默认）",
+            MeSettings.STATIC_POLICY_TIMELAPSE to "A 抽帧录像（静止时只存关键帧，约 1fps，回看是快放效果）",
+            MeSettings.STATIC_POLICY_LOW_BITRATE to "B 动态码率（静止时降到 100kbps，画面连续）",
+            MeSettings.STATIC_POLICY_BOTH to "A+B（抽帧 + 低码率）"
+        )
+        policyOptions.forEach { (value, label) ->
+            policyGroup.addView(RadioButton(this).apply { text = label; id = 3000 + value })
+        }
+        policyGroup.check(3000 + MeSettings.getRecordStaticPolicy(this))
+        container.addView(policyGroup)
+
+        container.addView(sectionLabel("静止检测灵敏度（差异像素占比阈值，另含强差异小目标检测）"))
+        val sensGroup = RadioGroup(this)
+        listOf("高（0.3%，轻微动静就触发）", "中（0.6%）", "低（1.5%，较大动静才触发）").forEachIndexed { i, label ->
+            sensGroup.addView(RadioButton(this).apply { text = label; id = 4000 + i })
+        }
+        sensGroup.check(4000 + MeSettings.getRecordMotionSensitivity(this))
+        container.addView(sensGroup)
+
         container.addView(sectionLabel("摄像头序号（多摄像头设备可切换，默认 0）"))
         val cameraIndexInput = numberInput(MeSettings.getRecordCameraIndex(this))
         container.addView(cameraIndexInput)
@@ -702,7 +822,57 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(audioSwitch)
 
-        container.addView(sectionLabel("NAS 空间限制方式"))
+        // ===== 本机 USB 存储（OTG U 盘），与 NAS 可同时启用，复用同一组空间限制策略 =====
+        val usbSwitch = Switch(this).apply {
+            text = "同时存到本机 USB 设备（OTG U 盘）"
+            isChecked = MeSettings.isUsbRecordEnabled(this@MainActivity)
+            setPadding(0, padTop, 0, 0)
+        }
+        container.addView(usbSwitch)
+
+        val selectUsbButton = android.widget.Button(this).apply {
+            text = "选择 USB 录像目录"
+        }
+        container.addView(selectUsbButton)
+
+        // 目录路径用局部持有；SAF 回调先把选择结果持久化到 MeSettings，保存时若本地为空会回退读取。
+        var selectedUsbUri: String = MeSettings.getUsbRecordTreeUri(this)
+        val usbPathLabel = TextView(this).apply {
+            textSize = 12f
+            setPadding(0, padSmall, 0, 0)
+        }
+        fun renderUsbPath() {
+            usbPathLabel.text = if (selectedUsbUri.isNotEmpty()) {
+                "已选择 USB 目录（uri 末段）：…/" + Uri.parse(selectedUsbUri).lastPathSegment.orEmpty()
+                    .substringAfterLast('/')
+            } else {
+                "尚未选择目录：点击上方按钮，在 U 盘上新建或选择一个录像文件夹"
+            }
+        }
+        renderUsbPath()
+        container.addView(usbPathLabel)
+        recordDialogUsbSwitch = usbSwitch
+        recordDialogUsbPathLabel = usbPathLabel
+
+        selectUsbButton.setOnClickListener {
+            try {
+                // 让系统同时展示可移动存储，并允许在 U 盘上新建目录。
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+                    )
+                    putExtra("android.content.extra.SHOW_ADVANCED", true)
+                }
+                startActivityForResult(intent, REQUEST_USB_TREE)
+            } catch (_: Exception) {
+                Toast.makeText(this, "当前系统不支持选择目录", Toast.LENGTH_LONG).show()
+            }
+        }
+
+        container.addView(sectionLabel("NAS 空间限制方式（NAS 与 USB 共用）"))
         val quotaGroup = RadioGroup(this)
         val reserveRadio = RadioButton(this).apply {
             text = "保留可用空间（可用空间不足时删除最早录像）"
@@ -801,8 +971,15 @@ class MainActivity : AppCompatActivity() {
                     urlInput.error = "地址需以 http:// 或 https:// 开头"
                     return@setOnClickListener
                 }
-                if (url.isEmpty() && enabledSwitch.isChecked) {
-                    urlInput.error = "开启录像必须填写 WebDAV 地址"
+                if (url.isEmpty() && enabledSwitch.isChecked && !usbSwitch.isChecked) {
+                    urlInput.error = "NAS 与 USB 至少需要配置一个存储目标"
+                    return@setOnClickListener
+                }
+                // SAF 回调可能已更新持久化值；以当前选择为准，未选择时回退已保存值。
+                val effectiveUsbUri = selectedUsbUri.ifEmpty { MeSettings.getUsbRecordTreeUri(this) }
+                // 勾选了 USB 就必须先选好并持久授权一个目录。
+                if (usbSwitch.isChecked && effectiveUsbUri.isEmpty()) {
+                    usbPathLabel.text = "请先点击“选择 USB 录像目录”授权一个文件夹"
                     return@setOnClickListener
                 }
                 val cameraIndex = cameraIndexInput.text.toString().ifEmpty { "0" }.toIntOrNull()
@@ -843,16 +1020,38 @@ class MainActivity : AppCompatActivity() {
                 })
                 MeSettings.setRecordCameraIndex(this, cameraIndex)
                 MeSettings.setRecordAudioEnabled(this, audioSwitch.isChecked)
+                val rotationAngle = rotationGroup.checkedRadioButtonId - 1000
+                MeSettings.setRecordRotation(this, rotationAngle)
+                val newCodec = if (codecGroup.checkedRadioButtonId == 2001) {
+                    MeSettings.CODEC_H265
+                } else {
+                    MeSettings.CODEC_H264
+                }
+                val newPolicy = policyGroup.checkedRadioButtonId - 3000
+                val newSens = sensGroup.checkedRadioButtonId - 4000
+                val newFps = fpsGroup.checkedRadioButtonId - 5000
+                val needServerRestart = newCodec != MeSettings.getRecordCodec(this) ||
+                    newPolicy != MeSettings.getRecordStaticPolicy(this) ||
+                    newSens != MeSettings.getRecordMotionSensitivity(this) ||
+                    newFps != MeSettings.getRecordFps(this)
+                MeSettings.setRecordCodec(this, newCodec)
+                MeSettings.setRecordStaticPolicy(this, newPolicy)
+                MeSettings.setRecordMotionSensitivity(this, newSens)
+                MeSettings.setRecordFps(this, newFps)
                 MeSettings.setQuotaMode(this, quotaGroup.checkedRadioButtonId)
                 MeSettings.setQuotaReserveMb(this, reserveMb)
                 MeSettings.setQuotaLimitMb(this, limitMb)
                 MeSettings.setLocalCacheMb(this, cacheMb)
+                // USB 目录与开关随录像设置一起持久化；tree uri 在选择目录时已取得持久授权。
+                MeSettings.setUsbRecordTreeUri(this, effectiveUsbUri)
+                MeSettings.setUsbRecordEnabled(this, usbSwitch.isChecked)
                 MeSettings.setRecordEnabled(this, enabledSwitch.isChecked)
 
+                val storageActive = url.isNotEmpty() || (usbSwitch.isChecked && effectiveUsbUri.isNotEmpty())
                 settingsPopupMenu?.menu?.findItem(OPEN_RECORD_SETTINGS)?.title =
-                    if (enabledSwitch.isChecked) "NAS录像设置（已开启）" else "NAS录像设置"
+                    if (enabledSwitch.isChecked && storageActive) "录像设置（已开启）" else "NAS录像设置"
 
-                val wantRecord = enabledSwitch.isChecked && url.isNotEmpty()
+                val wantRecord = enabledSwitch.isChecked && storageActive
                 if (wantRecord && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     val missing = buildList {
                         if (ActivityCompat.checkSelfPermission(
@@ -879,15 +1078,55 @@ class MainActivity : AppCompatActivity() {
                             REQUEST_RECORD_PERMISSIONS
                         )
                     } else {
-                        MeService.me?.syncCameraServerSetting()
+                        if (needServerRestart) {
+                            MeService.me?.restartCameraServer()
+                        } else {
+                            MeService.me?.syncCameraServerSetting()
+                        }
                     }
                 } else {
-                    MeService.me?.syncCameraServerSetting()
+                    if (needServerRestart) {
+                        MeService.me?.restartCameraServer()
+                    } else {
+                        MeService.me?.syncCameraServerSetting()
+                    }
                 }
                 dialog.dismiss()
             }
         }
         dialog.show()
+        dialog.setOnDismissListener {
+            // 释放对已关闭对话框控件的引用，避免泄漏 Activity。
+            recordDialogUsbPathLabel = null
+            recordDialogUsbSwitch = null
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_USB_TREE) return
+        val treeUri = data?.data
+        if (resultCode != RESULT_OK || treeUri == null) {
+            Toast.makeText(this, "未选择目录", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // 持久化读写授权，重启后仍可访问该 U 盘目录（U 盘拔出时授权暂不生效，重新插入即恢复）。
+        try {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            contentResolver.takePersistableUriPermission(treeUri, flags)
+            val uriString = treeUri.toString()
+            MeSettings.setUsbRecordTreeUri(this, uriString)
+            // 回写到当前打开的对话框；若对话框已关，则下次打开会读取已保存值。
+            recordDialogUsbPathLabel?.text =
+                "已选择 USB 目录（uri 末段）：…/" + treeUri.lastPathSegment.orEmpty()
+                    .substringAfterLast('/')
+            recordDialogUsbSwitch?.isChecked = true
+            Toast.makeText(this, "已授权 USB 目录", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "USB 目录授权失败：${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     @Suppress("DEPRECATION")

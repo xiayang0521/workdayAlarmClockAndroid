@@ -13,7 +13,9 @@ internal data class RecordingInfo(
     val name: String,
     val size: Long,
     val timestampMs: Long,
-    val local: Boolean
+    val local: Boolean,
+    /** 动态（有画面变动）时间区间，相对 timestampMs 的毫秒偏移。 */
+    val motion: List<LongArray> = emptyList()
 )
 
 /**
@@ -26,6 +28,8 @@ internal data class RecordingInfo(
 internal class RecordingUploadManager(
     context: Context,
     private val localDir: File,
+    private val tracker: SegmentDeliveryTracker,
+    private val janitor: LocalCacheJanitor,
     private val log: (String) -> Unit
 ) : RecordingAccess {
     private val appContext: Context = context.applicationContext
@@ -33,6 +37,8 @@ internal class RecordingUploadManager(
         private const val RETRY_DELAY_MS = 15_000L
         private const val IDLE_POLL_MS = 10_000L
         private const val MAX_DELETE_PER_ROUND = 30
+        // 持久库全量列举的缓存窗口：平衡时间轴新鲜度与上千文件扫描的 HTTP 响应耗时。
+        private const val PERSISTENT_LIST_TTL_MS = 5_000L
     }
 
     private val running = AtomicBoolean(false)
@@ -42,6 +48,77 @@ internal class RecordingUploadManager(
     private val stateLock = Any()
 
     private var workerThread: Thread? = null
+
+    // 持久库（用户授权的本机/USB 投递目录）解析结果按 treeUri 缓存；设置变更（uri 变化）时重建。
+    @Volatile private var persistentTreeUri: String = ""
+    @Volatile private var persistentLibrary: PersistentLibrary? = null
+
+    /**
+     * 取当前配置对应的持久库视图。未开启本机投递、未选目录或无法映射为真实路径时返回 null，
+     * 调用方安静回退到"只看暂存 + NAS"。treeUri 是长期值，按其缓存避免每次列举都重解析。
+     */
+    private fun persistent(): PersistentLibrary? {
+        if (!MeSettings.isUsbRecordConfigured(appContext)) return null
+        // fs 直写模式（无屏远程指定的真实目录）优先，直接用 File 视图。
+        val fsPath = MeSettings.getUsbRecordFsPath(appContext)
+        if (fsPath.isNotEmpty()) {
+            if (fsPath != persistentTreeUri) {
+                synchronized(stateLock) {
+                    if (fsPath != persistentTreeUri) {
+                        val dir = java.io.File(fsPath)
+                        persistentLibrary =
+                            if (dir.exists() && dir.isDirectory) PersistentLibrary.forDirectory(dir)
+                            else null
+                        persistentTreeUri = fsPath
+                    }
+                }
+            }
+            return persistentLibrary
+        }
+        val treeUri = MeSettings.getUsbRecordTreeUri(appContext)
+        if (treeUri.isEmpty()) return null
+        if (treeUri != persistentTreeUri) {
+            synchronized(stateLock) {
+                if (treeUri != persistentTreeUri) {
+                    val candidate = PersistentLibrary(appContext, treeUri)
+                    persistentLibrary = if (candidate.isAvailable()) candidate else null
+                    persistentTreeUri = treeUri
+                }
+            }
+        }
+        return persistentLibrary
+    }
+
+    // 持久库可能有上千段，逐文件 stat（含 motion.json）较慢；用短 TTL 缓存聚合结果。
+    // 最新分段始终由暂存目录实时提供，故这里缓存几秒不会影响"刚录的段立即可见"。
+    @Volatile private var persistentInfoCache: List<RecordingInfo> = emptyList()
+    @Volatile private var persistentInfoCacheAt: Long = 0L
+
+    private fun persistentInfos(): List<RecordingInfo> {
+        val library = persistent() ?: run {
+            persistentInfoCache = emptyList()
+            persistentInfoCacheAt = 0L
+            return emptyList()
+        }
+        val now = System.currentTimeMillis()
+        if (now - persistentInfoCacheAt < PERSISTENT_LIST_TTL_MS && persistentInfoCache.isNotEmpty()) {
+            return persistentInfoCache
+        }
+        val infos = library.listRecordings().map { file ->
+            // 持久库由投递器只复制 mp4（不复制 .motion.json），本就没有动态标记；
+            // 这里不逐文件 stat，避免上千段时把首次 /rec/list 拖过客户端读超时。
+            RecordingInfo(
+                file.name,
+                file.length(),
+                RecordingNames.timestampOf(file.name),
+                true
+            )
+        }
+        persistentInfoCache = infos
+        persistentInfoCacheAt = now
+        return infos
+    }
+
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -74,6 +151,7 @@ internal class RecordingUploadManager(
 
     override fun listRecordings(): List<RecordingInfo> {
         val result = LinkedHashMap<String, RecordingInfo>()
+        // 1) 暂存目录：含最新分段及其动态标记，优先收录。
         synchronized(stateLock) {
             localDir.listFiles()?.forEach { file ->
                 if (file.isFile && RecordingNames.isRecording(file.name)) {
@@ -81,11 +159,20 @@ internal class RecordingUploadManager(
                         file.name,
                         file.length(),
                         RecordingNames.timestampOf(file.name),
-                        true
+                        true,
+                        motion = MotionMarks.readFor(file)
                     )
                 }
             }
         }
+        // 2) 持久库（/video 等）：暂存已被缓存清理滚动删除的全天旧段从这里补回。
+        //    同名以暂存为准（暂存是最新原件），持久库只补缺，保证时间轴覆盖全天。
+        persistentInfos().forEach { info ->
+            if (!result.containsKey(info.name)) {
+                result[info.name] = info
+            }
+        }
+        // 3) NAS：本机与持久库都没有的段再走远端（local=false）。
         tryListRemote()?.forEach { entry ->
             val name = remoteBasename(entry.path)
             if (isRecordingName(name) && !result.containsKey(name)) {
@@ -101,7 +188,9 @@ internal class RecordingUploadManager(
     }
 
     /**
-     * 打开录像用于在线播放/下载：本地存在则本地优先，否则经 WebDAV 代理。
+     * 打开录像用于在线播放/下载，三级回退：
+     * 暂存目录（最新原件）→ 持久库（全天旧段）→ NAS 代理。
+     * 前两者都映射成本地 File，复用 HTTP 层的 RandomAccessFile + Range，支持拖动。
      */
     override fun openForRead(name: String, rangeHeader: String?): RecordingReadHandle? {
         if (!isSafeName(name)) return null
@@ -110,6 +199,9 @@ internal class RecordingUploadManager(
             if (local.isFile) {
                 return RecordingReadHandle(local = local, connection = null)
             }
+        }
+        persistent()?.openForRead(name)?.let { persisted ->
+            return RecordingReadHandle(local = persisted, connection = null)
         }
         val client = createConfiguredClient() ?: return null
         return try {
@@ -143,9 +235,9 @@ internal class RecordingUploadManager(
             markFailed(file)
             return
         }
-        if (!MeSettings.isRecordConfigured(appContext)) {
-            requeue(file)
-            sleep(RETRY_DELAY_MS)
+        // 只配置了 USB、未配置 NAS 时，该分段无需上传：标记 NAS 不参与并交还本地缓存清理判断。
+        if (!MeSettings.isNasConfigured(appContext)) {
+            markFailed(file)
             return
         }
         val context = appContext
@@ -161,7 +253,9 @@ internal class RecordingUploadManager(
                 pendingNames.remove(file.name)
                 uploadedNames.add(file.name)
             }
-            enforceLocalCache(context)
+            tracker.markDone(file.name, DeliveryTarget.NAS)
+            val cacheBytes = MeSettings.getLocalCacheMb(context).toLong() * 1024L * 1024L
+            janitor.enforce(tracker, cacheBytes)
             enforceRemoteQuota(client, remoteDir, context)
         } catch (e: Exception) {
             if (running.get()) log("录像上传失败：${e.message}")
@@ -191,24 +285,6 @@ internal class RecordingUploadManager(
                 markFailed(file)
             }
         }, "record-retry").apply { isDaemon = true }.start()
-    }
-
-    private fun enforceLocalCache(context: android.content.Context) {
-        val cacheBytes = MeSettings.getLocalCacheMb(context).toLong() * 1024L * 1024L
-        synchronized(stateLock) {
-            val files = localDir.listFiles()?.toMutableList()
-                ?.filter { it.isFile && RecordingNames.isRecording(it.name) }
-                ?.sortedBy { RecordingNames.timestampOf(it.name) }
-                ?: return
-            var total = files.sumOf { it.length() }
-            val iterator = files.iterator()
-            while (total > cacheBytes && iterator.hasNext()) {
-                val file = iterator.next()
-                if (!uploadedNames.contains(file.name)) continue
-                val length = file.length()
-                if (file.delete()) total -= length
-            }
-        }
     }
 
     private fun enforceRemoteQuota(
@@ -263,7 +339,7 @@ internal class RecordingUploadManager(
         client: WebDavClient? = null,
         remoteDir: String? = null
     ): List<WebDavEntry>? {
-        if (!MeSettings.isRecordConfigured(appContext)) return null
+        if (!MeSettings.isNasConfigured(appContext)) return null
         val actualClient = client ?: createConfiguredClient() ?: return null
         val actualDir = remoteDir ?: MeSettings.getWebDavDir(appContext)
         return try {
@@ -277,7 +353,7 @@ internal class RecordingUploadManager(
     }
 
     private fun createConfiguredClient(): WebDavClient? {
-        if (!MeSettings.isRecordConfigured(appContext)) return null
+        if (!MeSettings.isNasConfigured(appContext)) return null
         return WebDavClient(
             MeSettings.getWebDavUrl(appContext),
             MeSettings.getWebDavUsername(appContext),
