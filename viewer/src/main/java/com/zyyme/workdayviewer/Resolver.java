@@ -46,6 +46,50 @@ public class Resolver {
     /** 串行化解析：系统同一时间只允许一个 resolveService 在跑，并发解析会互相挤失败。 */
     private static final Object RESOLVE_LOCK = new Object();
 
+    /**
+     * 强烈引用钉住的监听器集合。NsdManager 对 Listener 只持弱引用，
+     * 匿名对象传进去后可能被 GC，导致回调永远不来
+     * （系统日志表现为 "SERVICE_RESOLVED has no client mapping"）。
+     */
+    private static final java.util.Set<Object> PINNED =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<Object>());
+
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+
+    /**
+     * NsdManager 要求：实例在哪个线程创建，所有方法就应在哪个线程调用
+     * （通常必须主线程），且回调经主线程 Looper 派发。
+     * 在后台线程 getSystemService 会导致回调永远不来，解析必失败。
+     */
+    private static volatile NsdManager NSD_HOLDER = null;
+    private static final Object NSD_LOCK = new Object();
+
+    private static NsdManager nsdOnMain(Context ctx) {
+        if (NSD_HOLDER != null) return NSD_HOLDER;
+        synchronized (NSD_LOCK) {
+            if (NSD_HOLDER != null) return NSD_HOLDER;
+            final CountDownLatch latch = new CountDownLatch(1);
+            final NsdManager[] box = new NsdManager[1];
+            MAIN.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        box[0] = (NsdManager) ctx.getSystemService(Context.NSD_SERVICE);
+                    } catch (Exception ignored) {
+                    }
+                    NSD_HOLDER = box[0];
+                    latch.countDown();
+                }
+            });
+            try {
+                latch.await(2, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return NSD_HOLDER;
+        }
+    }
+
     /** 清除某域名的解析缓存（连接失败/IP 变化时调用，下次解析自动拿新 IP）。 */
     public static void evict(String host) {
         if (host == null) return;
@@ -78,6 +122,15 @@ public class Resolver {
                 }
             }
             result = resolveSlow(ctx, host, defaultPort);
+            // NSD 偶发启动失败/丢回调：隔 500ms 重试一次，别一次失败就抛域名给 HTTP 栈
+            if (!Config.isIp(result.host)) {
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                result = resolveSlow(ctx, host, defaultPort);
+            }
         }
         // 只缓存成功解析出的 IP；解析失败（原样返回域名）不缓存，
         // 避免一次失败把 5 分钟内的连接全部拖死。
@@ -106,11 +159,29 @@ public class Resolver {
             if (viaPrefix != null) return viaPrefix;
         } catch (Exception ignored) {
         }
+        // 同一台设备既当摄像头又装 viewer 时（单机部署很常见），本机 NSD 发现
+        // 回环服务经常不可靠；workday* 域名直接探测本机端口，命中即用 127.0.0.1。
+        if (name.toLowerCase().startsWith("workday") && probeLocalPort(defaultPort)) {
+            return new Endpoint("127.0.0.1", defaultPort);
+        }
         try {
             InetAddress address = InetAddress.getByName(host);
             return new Endpoint(address.getHostAddress(), defaultPort);
         } catch (Exception e) {
             return new Endpoint(host, defaultPort);
+        }
+    }
+
+    /** 探测本机指定端口是否有服务在监听（400ms 超时）。 */
+    private static boolean probeLocalPort(int port) {
+        java.net.Socket s = new java.net.Socket();
+        try {
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", port), 400);
+            return true;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            try { s.close(); } catch (Exception ignored) { }
         }
     }
 
@@ -122,8 +193,8 @@ public class Resolver {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN) return null;
         final Object lock = new Object();
         final java.util.List<NsdServiceInfo> workdayServices = new java.util.ArrayList<NsdServiceInfo>();
-        final Handler mainHandler = new Handler(Looper.getMainLooper());
-        final NsdManager nsdManager = (NsdManager) ctx.getSystemService(Context.NSD_SERVICE);
+        final Handler mainHandler = MAIN;
+        final NsdManager nsdManager = nsdOnMain(ctx);
         if (nsdManager == null) return null;
 
         final NsdManager.DiscoveryListener discovery = new NsdManager.DiscoveryListener() {
@@ -160,6 +231,7 @@ public class Resolver {
             public void onServiceLost(NsdServiceInfo serviceInfo) {
             }
         };
+        PINNED.add(discovery);
 
         mainHandler.post(new Runnable() {
             @Override
@@ -193,6 +265,7 @@ public class Resolver {
                     nsdManager.stopServiceDiscovery(discovery);
                 } catch (Exception ignored) {
                 }
+                PINNED.remove(discovery);
             }
         });
 
@@ -227,24 +300,39 @@ public class Resolver {
                                                final int defaultPort, long timeoutMs) {
         final AtomicReference<Endpoint> result = new AtomicReference<>();
         final CountDownLatch latch = new CountDownLatch(1);
-        try {
-            nsdManager.resolveService(info, new NsdManager.ResolveListener() {
-                @Override
-                public void onResolveFailed(NsdServiceInfo serviceInfo, int errorCode) {
-                    latch.countDown();
-                }
+        final NsdManager.ResolveListener listener = new NsdManager.ResolveListener() {
+            @Override
+            public void onResolveFailed(NsdServiceInfo serviceInfo, int errorCode) {
+                latch.countDown();
+            }
 
-                @Override
-                public void onServiceResolved(NsdServiceInfo serviceInfo) {
-                    InetAddress hostAddress = serviceInfo.getHost();
-                    if (hostAddress != null) {
-                        int port = serviceInfo.getPort() > 0 ? serviceInfo.getPort() : defaultPort;
-                        result.set(new Endpoint(hostAddress.getHostAddress(), port));
-                    }
-                    latch.countDown();
+            @Override
+            public void onServiceResolved(NsdServiceInfo serviceInfo) {
+                InetAddress hostAddress = serviceInfo.getHost();
+                if (hostAddress != null) {
+                    int port = serviceInfo.getPort() > 0 ? serviceInfo.getPort() : defaultPort;
+                    result.set(new Endpoint(hostAddress.getHostAddress(), port));
                 }
-            });
-        } catch (Exception e) {
+                latch.countDown();
+            }
+        };
+        PINNED.add(listener);
+        final CountDownLatch issued = new CountDownLatch(1);
+        MAIN.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    nsdManager.resolveService(info, listener);
+                } catch (Exception ignored) {
+                }
+                issued.countDown();
+            }
+        });
+        try {
+            issued.await(2, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            PINNED.remove(listener);
             return null;
         }
         try {
@@ -252,6 +340,7 @@ public class Resolver {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        PINNED.remove(listener);
         return result.get();
     }
 
@@ -259,8 +348,8 @@ public class Resolver {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN) return null;
         final AtomicReference<Endpoint> result = new AtomicReference<>();
         final CountDownLatch latch = new CountDownLatch(1);
-        final Handler mainHandler = new Handler(Looper.getMainLooper());
-        final NsdManager nsdManager = (NsdManager) ctx.getSystemService(Context.NSD_SERVICE);
+        final Handler mainHandler = MAIN;
+        final NsdManager nsdManager = nsdOnMain(ctx);
         if (nsdManager == null) return null;
 
         final NsdManager.DiscoveryListener discovery = new NsdManager.DiscoveryListener() {
@@ -312,6 +401,7 @@ public class Resolver {
             public void onServiceLost(NsdServiceInfo serviceInfo) {
             }
         };
+        PINNED.add(discovery);
 
         mainHandler.post(new Runnable() {
             @Override
@@ -336,6 +426,7 @@ public class Resolver {
                     nsdManager.stopServiceDiscovery(discovery);
                 } catch (Exception ignored) {
                 }
+                PINNED.remove(discovery);
             }
         });
         return result.get();

@@ -1482,8 +1482,8 @@ public class RecordingsActivity extends Activity {
                     livePassword = device.password;
                     URL url = new URL(baseHttp + "rec/list");
                     conn = (HttpURLConnection) url.openConnection();
-                    conn.setConnectTimeout(8000);
-                    conn.setReadTimeout(8000);
+                    conn.setConnectTimeout(10000);
+                    conn.setReadTimeout(30000); // 相机端要合并本地+NAS 列表，段数多时需要数秒
                     int code = conn.getResponseCode();
                     if (code != 200) {
                         postToast("加载录像失败（HTTP " + code + "），检查地址密码");

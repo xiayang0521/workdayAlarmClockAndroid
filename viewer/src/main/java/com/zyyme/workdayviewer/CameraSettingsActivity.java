@@ -48,6 +48,9 @@ public class CameraSettingsActivity extends Activity {
     private RadioGroup quotaGroup;
     private EditText reserveInput, limitInput, cacheInput;
     private boolean storageSupported = false;
+    // 存储配置读取失败（超时/旧固件）时为 true：保存绝不下发 nas*/usb* 字段，
+    // 否则空表单会把相机端已配好的 NAS、USB 存储全部清空/关掉。
+    private boolean storageReadFailed = false;
 
     // NAS（WebDAV）远程配置
     private EditText nasUrlInput, nasUserInput, nasPassInput, nasDirInput;
@@ -187,8 +190,8 @@ public class CameraSettingsActivity extends Activity {
         try {
             URL url = new URL(urlText);
             conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(6000);
-            conn.setReadTimeout(15000); // NAS 统计要走一次网络列表，放宽超时
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(30000); // NAS 统计 + U 盘统计可能很慢，相机端有缓存但首刷仍可能超时
             if (conn.getResponseCode() != 200) return null;
             InputStream in = conn.getInputStream();
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
@@ -273,14 +276,17 @@ public class CameraSettingsActivity extends Activity {
         container.addView(storageStatusText);
 
         if (storage == null) {
-            // NAS 无响应等原因导致读取失败时，绝不藏掉存储设置：
-            // 仍然渲染 NAS / USB / 配额表单（空值兜底），让用户可以修正错误配置。
+            // NAS 无响应等原因导致读取失败：表单照常渲染（方便看提示），
+            // 但标记 storageReadFailed，保存时跳过整个存储分区，绝不用空值覆盖相机配置。
             storageSupported = true;
-            storageStatusText.setText("存储状态读取失败（可能 NAS 无响应或摄像头繁忙），" +
-                    "仍可修改以下配置后保存。");
+            storageReadFailed = true;
+            storageStatusText.setText("存储状态读取失败（摄像头响应慢或旧固件），" +
+                    "仍可修改摄像头参数并保存；存储设置本次不会变动，" +
+                    "重进本页面待读取成功后再修改。");
             storage = new JSONObject();
         } else {
             storageSupported = true;
+            storageReadFailed = false;
         }
 
         // 空间占用总览
@@ -877,7 +883,7 @@ public class CameraSettingsActivity extends Activity {
             json.put("audio", audioSwitch.isChecked());
             json.put("policy", policyGroup.getCheckedRadioButtonId() - 1000);
             json.put("sens", sensGroup.getCheckedRadioButtonId() - 1000);
-            if (storageSupported) {
+            if (storageSupported && !storageReadFailed) {
                 // NAS（WebDAV）远程配置；密码留空表示不修改原密码。
                 storageJson.put("nasUrl", nasUrlInput.getText().toString().trim());
                 storageJson.put("nasUsername", nasUserInput.getText().toString().trim());
@@ -913,12 +919,15 @@ public class CameraSettingsActivity extends Activity {
                     String error = postJson(base + "cam/settings", json);
                     if (error != null) {
                         msg = error;
-                    } else if (storageSupported) {
+                    } else if (storageSupported && !storageReadFailed) {
                         // 存储配置改动不需要重启摄像头服务，失败时单独提示
                         error = postJson(base + "cam/storage", storageJson);
                         msg = error != null
                                 ? "编码参数已保存；存储设置保存失败（" + error + "）"
                                 : "已保存，摄像头服务重启中，约 5 秒后生效";
+                    } else if (storageReadFailed) {
+                        // 存储配置没读取成功：绝不下发，避免空表单清空相机端 NAS/USB 配置
+                        msg = "摄像头参数已保存；存储设置本次未读取成功、未做任何改动，请重进本页面后再修改存储";
                     } else {
                         msg = "已保存，摄像头服务重启中，约 5 秒后生效";
                     }
