@@ -46,6 +46,19 @@ public class Resolver {
     /** 串行化解析：系统同一时间只允许一个 resolveService 在跑，并发解析会互相挤失败。 */
     private static final Object RESOLVE_LOCK = new Object();
 
+    /** 清除某域名的解析缓存（连接失败/IP 变化时调用，下次解析自动拿新 IP）。 */
+    public static void evict(String host) {
+        if (host == null) return;
+        String name = host.endsWith(".local") ? host.substring(0, host.length() - 6) : host;
+        String key = name + ":";
+        synchronized (cache) {
+            java.util.Iterator<Map.Entry<String, CachedEndpoint>> it = cache.entrySet().iterator();
+            while (it.hasNext()) {
+                if (it.next().getKey().startsWith(key)) it.remove();
+            }
+        }
+    }
+
     /** 阻塞解析，最多 5 秒；必须在后台线程调用。 */
     public static Endpoint resolve(Context ctx, String host, int defaultPort) {
         String key = host + ":" + defaultPort;

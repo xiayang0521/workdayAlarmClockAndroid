@@ -262,6 +262,14 @@ public class RecordingsActivity extends Activity {
                         && liveCandidateIndex + 1 < liveCandidates.size()) {
                     liveCandidateIndex++;
                     startLiveCandidate();
+                    return;
+                }
+                // 断线类错误：清掉域名解析缓存，稍后带重新解析出的 IP 整体重启。
+                // 摄像头换网络/IP 变化后能自动恢复，不用手动改设备地址。
+                if (liveMode && (message.contains("画面中断") || message.contains("连接失败"))) {
+                    Config.Device d = Config.activeDevice(RecordingsActivity.this);
+                    if (d != null) Resolver.evict(d.host);
+                    scheduleLiveRestart();
                 }
             }
         });
@@ -1521,6 +1529,12 @@ public class RecordingsActivity extends Activity {
                     }
                     onLoaded(list);
                 } catch (Exception e) {
+                    // 加载失败：清域名解析缓存，下次重试会重新解析（IP 变化自动恢复）。
+                    try {
+                        Config.Device dev = Config.activeDevice(RecordingsActivity.this);
+                        if (dev != null) Resolver.evict(dev.host);
+                    } catch (Exception ignored) {
+                    }
                     postToast("加载录像失败：" + e.getMessage());
                 } finally {
                     if (conn != null) conn.disconnect();
@@ -1764,6 +1778,27 @@ public class RecordingsActivity extends Activity {
         handler.removeCallbacks(bitrateTicker);
         if (mjpegView != null) mjpegView.stop();
         if (h264Decoder != null) h264Decoder.release();
+    }
+
+    private boolean liveRestartPending = false;
+
+    /**
+     * 断线后带新解析的 IP 整体重启实时链路。
+     * 清掉 liveHost 强制走重新解析（Resolver 缓存已被 evict），
+     * 摄像头 IP 变化后无需手动改地址即可自动恢复。
+     */
+    private void scheduleLiveRestart() {
+        if (liveRestartPending || !liveMode || isFinishing()) return;
+        liveRestartPending = true;
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                liveRestartPending = false;
+                if (!liveMode || isFinishing()) return;
+                liveHost = "";
+                startLive();
+            }
+        }, 4000);
     }
 
     /**
