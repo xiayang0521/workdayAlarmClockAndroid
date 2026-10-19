@@ -23,10 +23,46 @@ import java.util.concurrent.TimeUnit
 object LanDomainResolver {
 
     private const val CACHE_TTL_MS = 5 * 60 * 1000L
+    private const val FAILURE_COOLDOWN_MS = 60 * 1000L
     private const val PREFIX = "workday"
 
     private val lock = Any()
     private val cache = HashMap<String, Pair<String, Long>>()
+    private val failures = HashMap<String, Long>()
+
+    /**
+     * 强烈引用钉住的监听器集合。NsdManager 对 Listener 只持弱引用，
+     * 匿名对象传进去后若立即被 GC，回调永远不来（系统日志表现
+     * 为 "SERVICE_RESOLVED has no client mapping"），解析必然超时。
+     */
+    private val pinnedListeners =
+        java.util.Collections.synchronizedSet(HashSet<Any>())
+
+    // NsdManager 要求在其创建的线程（主线程）上调用所有方法，
+    // 否则回调可能永远不来。这里保证实例在主线程获取、方法在主线程调用。
+    @Volatile private var nsdHolder: NsdManager? = null
+    private val nsdInitLock = Object()
+
+    private fun nsdOnMain(context: Context): NsdManager? {
+        nsdHolder?.let { return it }
+        synchronized(nsdInitLock) {
+            nsdHolder?.let { return it }
+            val latch = CountDownLatch(1)
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    nsdHolder = context.getSystemService(Context.NSD_SERVICE) as? NsdManager
+                } catch (_: Exception) {
+                }
+                latch.countDown()
+            }
+            try {
+                latch.await(2, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            return nsdHolder
+        }
+    }
 
     fun isIp(host: String): Boolean =
         host.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$"))
@@ -40,10 +76,24 @@ object LanDomainResolver {
             if (hit != null && System.currentTimeMillis() - hit.second < CACHE_TTL_MS) {
                 return hit.first
             }
+            // 失败冷却：刚解析失败过的域名 60 秒内不再发 NSD 请求，
+            // 避免 NAS 离线时每次上传/统计都触发数秒的解析风暴，
+            // 也避免与局域网其他设备的 mDNS 发现相互挤失败。
+            val failedAt = failures[name]
+            if (failedAt != null && System.currentTimeMillis() - failedAt < FAILURE_COOLDOWN_MS) {
+                return host
+            }
         }
-        val ip = resolveViaNsd(context, name) ?: return host
-        synchronized(lock) { cache[name] = ip to System.currentTimeMillis() }
-        return ip
+        val ip = resolveViaNsd(context, name)
+        synchronized(lock) {
+            if (ip != null) {
+                failures.remove(name)
+                cache[name] = ip to System.currentTimeMillis()
+            } else {
+                failures[name] = System.currentTimeMillis()
+            }
+        }
+        return ip ?: host
     }
 
     /** 清除某域名的解析缓存：连接失败/IP 变化时调用，下次解析自动更新。 */
@@ -67,6 +117,15 @@ object LanDomainResolver {
         return try {
             val u = URL(url)
             val host = u.host ?: return url to null
+            if (!isIp(host)) {
+                val name = host.removeSuffix(".local")
+                // 摄像头与咩存储装在同一台设备时（单机部署很常见），本机 NSD 解析
+                // 回环并不可靠：workday* 域名且本机对应端口有服务在听，直接用 127.0.0.1。
+                if (name.startsWith(PREFIX, ignoreCase = true) && probeLocalPort(u.port)) {
+                    val port = if (u.port > 0) ":${u.port}" else ""
+                    return "${u.protocol}://127.0.0.1$port${u.file}" to "127.0.0.1"
+                }
+            }
             val resolved = resolveHost(context, host)
             if (resolved == host) {
                 url to null
@@ -79,9 +138,22 @@ object LanDomainResolver {
         }
     }
 
+    /** 探测本机指定端口是否有服务在监听（400ms 超时）。 */
+    private fun probeLocalPort(port: Int): Boolean {
+        if (port <= 0) return false
+        return try {
+            java.net.Socket().use { s ->
+                s.connect(java.net.InetSocketAddress("127.0.0.1", port), 400)
+                true
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun resolveViaNsd(context: Context, name: String): String? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN) return null
-        val nsd = context.getSystemService(Context.NSD_SERVICE) as? NsdManager ?: return null
+        val nsd = nsdOnMain(context) ?: return null
         val mainHandler = Handler(Looper.getMainLooper())
 
         val lockObj = Object()
@@ -105,6 +177,7 @@ object LanDomainResolver {
             }
             override fun onServiceLost(serviceInfo: NsdServiceInfo?) {}
         }
+        pinnedListeners.add(discovery)
         try {
             mainHandler.post {
                 try {
@@ -135,6 +208,7 @@ object LanDomainResolver {
                 nsd.stopServiceDiscovery(discovery)
             } catch (_: Exception) {
             }
+            pinnedListeners.remove(discovery)
         }
 
         // 优先精确同名；否则局域网里只有一台 workday* 服务时兜底用它
@@ -144,17 +218,30 @@ object LanDomainResolver {
 
         val latch = CountDownLatch(1)
         val ipHolder = arrayOfNulls<String>(1)
+        val resolveListener = object : NsdManager.ResolveListener {
+            override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {
+                latch.countDown()
+            }
+            override fun onServiceResolved(serviceInfo: NsdServiceInfo?) {
+                ipHolder[0] = serviceInfo?.host?.hostAddress
+                latch.countDown()
+            }
+        }
+        pinnedListeners.add(resolveListener)
+        // resolveService 也必须在主线程调用（与 NsdManager 创建线程一致）
+        val issued = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                nsd.resolveService(target, resolveListener)
+            } catch (_: Exception) {
+            }
+            issued.countDown()
+        }
         try {
-            nsd.resolveService(target, object : NsdManager.ResolveListener {
-                override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {
-                    latch.countDown()
-                }
-                override fun onServiceResolved(serviceInfo: NsdServiceInfo?) {
-                    ipHolder[0] = serviceInfo?.host?.hostAddress
-                    latch.countDown()
-                }
-            })
-        } catch (_: Exception) {
+            issued.await(2, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            pinnedListeners.remove(resolveListener)
             return null
         }
         try {
@@ -162,6 +249,7 @@ object LanDomainResolver {
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
         }
+        pinnedListeners.remove(resolveListener)
         return ipHolder[0]
     }
 

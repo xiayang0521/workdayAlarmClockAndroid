@@ -1774,20 +1774,14 @@ internal class CameraHttpServer(
                 .put("enabled", usbEnabled)
                 .put("configured", MeSettings.isUsbRecordConfigured(ctx))
                 .put("fsPath", usbFsPath)
-            if (usbEnabled) {
-                try {
-                    UsbRecordTargets.create(ctx)?.let { store ->
-                        val ready = store.isAvailable()
-                        usbObj.put("ready", ready)
-                        if (ready) {
-                            val files = store.listRecordings()
-                            usbObj.put("count", files.size)
-                            usbObj.put("usedBytes", files.sumOf { it.size })
-                            store.availableBytes()?.let { usbObj.put("availableBytes", it) }
-                        }
-                    }
-                } catch (e: Exception) {
-                    // U 盘拔出或授权失效时其余信息仍可返回
+            // U 盘文件统计（几千个文件逐个 stat）可能耗时十几秒，绝不能阻塞请求：
+            // 只回读缓存，超过 60 秒未刷新就在后台补一次，viewer 下次进来即是最新值。
+            usbStatsCached(ctx, usbEnabled)?.let { stats ->
+                usbObj.put("ready", stats.ready)
+                if (stats.ready) {
+                    usbObj.put("count", stats.count)
+                    usbObj.put("usedBytes", stats.usedBytes)
+                    stats.availableBytes?.let { usbObj.put("availableBytes", it) }
                 }
             }
             // treeUri 仅供诊断/兼容，viewer 新流程使用 fsPath；无屏设备一般为空。
@@ -1948,10 +1942,14 @@ internal class CameraHttpServer(
                 MeSettings.getWebDavUsername(ctx),
                 MeSettings.getWebDavPassword(ctx)
             )
-            client.list(MeSettings.getWebDavDir(ctx))
+            val t0 = System.currentTimeMillis()
+            val total = client.list(MeSettings.getWebDavDir(ctx))
                 .filter { !it.isDirectory }
                 .sumOf { it.size }
-        } catch (_: Exception) {
+            android.util.Log.i("NasStats", "NAS 统计成功：${total}B，耗时 ${System.currentTimeMillis() - t0}ms")
+            total
+        } catch (e: Exception) {
+            android.util.Log.w("NasStats", "NAS 统计失败：${e.javaClass.simpleName}: ${e.message}")
             null
         }
     }
@@ -1961,7 +1959,7 @@ internal class CameraHttpServer(
      * NAS 不可达时 WebDAV 连接超时很长，绝不能拖住 /cam/storage 整个请求，
      * 否则 viewer 读超时会认为「后台不支持存储设置」，把存储分区整个藏掉。
      */
-    private fun nasUsedBytesAsync(ctx: android.content.Context, waitMs: Long = 4000): Long? {
+    private fun nasUsedBytesAsync(ctx: android.content.Context, waitMs: Long = 8000): Long? {
         val holder = arrayOfNulls<Long>(1)
         val t = Thread {
             holder[0] = nasUsedBytes(ctx)
@@ -1974,6 +1972,67 @@ internal class CameraHttpServer(
         } catch (_: InterruptedException) {
             null
         }
+    }
+
+    // ---------- USB 空间统计缓存 ----------
+    // U 盘（SAF/FUSE）逐文件 stat 统计极慢（数千文件可达十几秒），
+    // 请求路径只读缓存；超过 TTL 后台刷新，避免 viewer 读超时后误判 USB 关闭。
+    private class UsbStats(
+        val ready: Boolean,
+        val count: Int,
+        val usedBytes: Long,
+        val availableBytes: Long?,
+    )
+
+    private val usbStatsLock = Any()
+    private var usbStatsCache: UsbStats? = null
+    private var usbStatsAtMs = 0L
+    private var usbStatsRefreshing = false
+
+    private fun usbStatsCached(ctx: android.content.Context, usbEnabled: Boolean): UsbStats? {
+        if (!usbEnabled) {
+            synchronized(usbStatsLock) {
+                usbStatsCache = null
+                usbStatsAtMs = 0L
+            }
+            return null
+        }
+        val now = System.currentTimeMillis()
+        val cached: UsbStats?
+        val needRefresh: Boolean
+        synchronized(usbStatsLock) {
+            cached = usbStatsCache
+            needRefresh = now - usbStatsAtMs > 60_000 && !usbStatsRefreshing
+            if (needRefresh) usbStatsRefreshing = true
+        }
+        if (needRefresh) {
+            val t = Thread {
+                val stats = try {
+                    UsbRecordTargets.create(ctx)?.let { store ->
+                        if (!store.isAvailable()) {
+                            UsbStats(false, 0, 0L, null)
+                        } else {
+                            val files = store.listRecordings()
+                            UsbStats(true, files.size, files.sumOf { it.size }, store.availableBytes())
+                        }
+                    }
+                } catch (e: Exception) {
+                    // U 盘拔出或授权失效：保留旧缓存，下次再试
+                    synchronized(usbStatsLock) { usbStatsCache }
+                }
+                synchronized(usbStatsLock) {
+                    if (stats != null) {
+                        usbStatsCache = stats
+                        usbStatsAtMs = System.currentTimeMillis()
+                    }
+                    usbStatsRefreshing = false
+                }
+            }
+            t.isDaemon = true
+            t.name = "usb-stats-refresh"
+            t.start()
+        }
+        return cached
     }
 
     /**

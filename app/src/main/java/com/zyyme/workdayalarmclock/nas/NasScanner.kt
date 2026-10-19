@@ -34,15 +34,28 @@ object NasScanner {
 
     private fun doScan(context: Context, seconds: Int): List<Candidate> {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN) return emptyList()
-        val nsd = context.getSystemService(Context.NSD_SERVICE) as? NsdManager ?: return emptyList()
+        val mainHandler = Handler(Looper.getMainLooper())
+        // NsdManager 必须在主线程创建、所有方法在主线程调用，否则回调可能丢失
+        val nsdInit = CountDownLatch(1)
+        val nsdBox = arrayOfNulls<NsdManager>(1)
+        mainHandler.post {
+            try {
+                nsdBox[0] = context.getSystemService(Context.NSD_SERVICE) as? NsdManager
+            } catch (_: Exception) {
+            }
+            nsdInit.countDown()
+        }
+        try {
+            nsdInit.await(2, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return emptyList()
+        }
+        val nsd = nsdBox[0] ?: return emptyList()
 
         val found = LinkedHashMap<String, NsdServiceInfo>()
-        val started = CountDownLatch(1)
         val discovery = object : NsdManager.DiscoveryListener {
-            override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {
-                started.countDown()
-            }
-
+            override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {}
             override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {}
             override fun onDiscoveryStarted(serviceType: String?) {}
             override fun onDiscoveryStopped(serviceType: String?) {}
@@ -56,15 +69,29 @@ object NasScanner {
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo?) {}
         }
+        pinnedListeners.add(discovery)
+        val issued = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                nsd.discoverServices("_http._tcp.", NsdManager.PROTOCOL_DNS_SD, discovery)
+            } catch (e: Exception) {
+            }
+            issued.countDown()
+        }
         try {
-            nsd.discoverServices("_http._tcp.", NsdManager.PROTOCOL_DNS_SD, discovery)
-        } catch (e: Exception) {
+            issued.await(2, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            pinnedListeners.remove(discovery)
             return emptyList()
         }
         Thread.sleep(seconds * 1000L)
-        try {
-            nsd.stopServiceDiscovery(discovery)
-        } catch (_: Exception) {
+        mainHandler.post {
+            try {
+                nsd.stopServiceDiscovery(discovery)
+            } catch (e: Exception) {
+            }
+            pinnedListeners.remove(discovery)
         }
 
         val result = LinkedHashMap<String, Candidate>() // key: host:port 去重
@@ -87,29 +114,49 @@ object NasScanner {
         return result.values.toList()
     }
 
-    /** 解析单个服务，最多等 3 秒；失败返回 null。 */
+    /** 钉住进行中的 Listener，防止被 GC（NsdManager 只持弱引用）。 */
+    private val pinnedListeners =
+        java.util.Collections.synchronizedSet(HashSet<Any>())
+
+    /** 解析单个服务，最多等 3 秒；失败返回 null。resolveService 在主线程执行。 */
     private fun resolveOne(nsd: NsdManager, info: NsdServiceInfo): NsdServiceInfo? {
         val latch = CountDownLatch(1)
         val holder = arrayOfNulls<NsdServiceInfo>(1)
-        try {
-            nsd.resolveService(info, object : NsdManager.ResolveListener {
-                override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {
-                    latch.countDown()
-                }
+        // NsdManager 只弱引用 Listener，必须强引用钉住，否则回调可能被 GC 吃掉
+        val listener = object : NsdManager.ResolveListener {
+            override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {
+                latch.countDown()
+            }
 
-                override fun onServiceResolved(serviceInfo: NsdServiceInfo?) {
-                    holder[0] = serviceInfo
-                    latch.countDown()
-                }
-            })
-        } catch (e: Exception) {
+            override fun onServiceResolved(serviceInfo: NsdServiceInfo?) {
+                holder[0] = serviceInfo
+                latch.countDown()
+            }
+        }
+        pinnedListeners.add(listener)
+        val mainHandler = Handler(Looper.getMainLooper())
+        val issued = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                nsd.resolveService(info, listener)
+            } catch (e: Exception) {
+            }
+            issued.countDown()
+        }
+        try {
+            issued.await(2, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            pinnedListeners.remove(listener)
             return null
         }
-        return try {
+        val r = try {
             latch.await(3, TimeUnit.SECONDS)
             holder[0]
         } catch (e: InterruptedException) {
             null
         }
+        pinnedListeners.remove(listener)
+        return r
     }
 }
