@@ -32,6 +32,7 @@ import com.zyyme.workdayalarmclock.BuildConfig
 import com.zyyme.workdayalarmclock.MeSettings
 import com.zyyme.workdayalarmclock.record.RecordingAccess
 import com.zyyme.workdayalarmclock.nas.WebDavClient
+import com.zyyme.workdayalarmclock.nas.LanDomainResolver
 import com.zyyme.workdayalarmclock.record.FsUsbRecordStore
 import com.zyyme.workdayalarmclock.record.UsbRecordTargets
 import org.json.JSONObject
@@ -1832,9 +1833,15 @@ internal class CameraHttpServer(
         }
         val result = org.json.JSONObject()
         try {
-            WebDavClient(url, username, password).testConnection()
+            // 域名（workdayXXXXXX.local）先经 mDNS 解析成 IP 再连接，
+            // 并告知实际使用的 IP，方便排查；解析结果缓存 5 分钟。
+            val (resolvedUrl, viaIp) = LanDomainResolver.resolveUrl(ctx, url)
+            WebDavClient(resolvedUrl, username, password).testConnection()
             result.put("ok", true)
+            if (viaIp != null) result.put("via", viaIp)
         } catch (e: Exception) {
+            // 连接失败：清掉该域名的解析缓存，下次自动重新解析（IP 变了能自愈）。
+            LanDomainResolver.evictUrl(url)
             // 业务失败也回 200，用 ok:false + error 表达，viewer 直接展示错误原因。
             result.put("ok", false).put("error", e.message ?: "连接失败")
         }
@@ -1937,7 +1944,7 @@ internal class CameraHttpServer(
     private fun nasUsedBytes(ctx: android.content.Context): Long? {
         return try {
             val client = WebDavClient(
-                MeSettings.getWebDavUrl(ctx),
+                LanDomainResolver.resolveUrl(ctx, MeSettings.getWebDavUrl(ctx)).first,
                 MeSettings.getWebDavUsername(ctx),
                 MeSettings.getWebDavPassword(ctx)
             )

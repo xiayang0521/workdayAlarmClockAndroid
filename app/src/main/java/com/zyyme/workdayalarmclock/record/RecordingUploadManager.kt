@@ -4,6 +4,7 @@ import android.content.Context
 import com.zyyme.workdayalarmclock.MeSettings
 import com.zyyme.workdayalarmclock.nas.WebDavClient
 import com.zyyme.workdayalarmclock.nas.WebDavEntry
+import com.zyyme.workdayalarmclock.nas.LanDomainResolver
 import java.io.File
 import java.net.HttpURLConnection
 import java.util.concurrent.LinkedBlockingQueue
@@ -245,7 +246,8 @@ internal class RecordingUploadManager(
         val username = MeSettings.getWebDavUsername(context)
         val password = MeSettings.getWebDavPassword(context)
         val remoteDir = MeSettings.getWebDavDir(context)
-        val client = WebDavClient(baseUrl, username, password)
+        // 域名（workdayXXXXXX.local）先解析成 IP 再连；失败会清缓存，下次重试自动重新解析。
+        val client = WebDavClient(LanDomainResolver.resolveUrl(context, baseUrl).first, username, password)
         try {
             client.mkdirs(remoteDir)
             client.upload(file, joinPath(remoteDir, file.name))
@@ -259,6 +261,7 @@ internal class RecordingUploadManager(
             enforceRemoteQuota(client, remoteDir, context)
         } catch (e: Exception) {
             if (running.get()) log("录像上传失败：${e.message}")
+            LanDomainResolver.evictUrl(baseUrl)
             requeue(file)
             sleep(RETRY_DELAY_MS)
         }
@@ -355,7 +358,7 @@ internal class RecordingUploadManager(
     private fun createConfiguredClient(): WebDavClient? {
         if (!MeSettings.isNasConfigured(appContext)) return null
         return WebDavClient(
-            MeSettings.getWebDavUrl(appContext),
+            LanDomainResolver.resolveUrl(appContext, MeSettings.getWebDavUrl(appContext)).first,
             MeSettings.getWebDavUsername(appContext),
             MeSettings.getWebDavPassword(appContext)
         )

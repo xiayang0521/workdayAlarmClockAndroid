@@ -41,6 +41,7 @@ import com.zyyme.workdayalarmclock.camera.AmbientBrightnessController
 import com.zyyme.workdayalarmclock.nas.NasScanner
 import com.zyyme.workdayalarmclock.nas.WebDavClient
 import com.zyyme.workdayalarmclock.nas.WebDavException
+import com.zyyme.workdayalarmclock.nas.LanDomainResolver
 import com.zyyme.workdayalarmclock.notification.MeNotificationListenerService
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -941,7 +942,9 @@ class MainActivity : AppCompatActivity() {
                 var success = false
                 var message = ""
                 try {
-                    val client = WebDavClient(url, username, password)
+                    // 域名（workdayXXXXXX.local）先经 mDNS 解析成 IP 再连接。
+                    val resolvedUrl = LanDomainResolver.resolveUrl(this, url).first
+                    val client = WebDavClient(resolvedUrl, username, password)
                     client.testConnection()
                     if (dir.isNotEmpty()) {
                         client.mkdirs(dir)
@@ -952,6 +955,7 @@ class MainActivity : AppCompatActivity() {
                 } catch (e: Exception) {
                     message = "连接失败：${e.message ?: e.javaClass.simpleName}"
                 }
+                if (!success) LanDomainResolver.evictUrl(url)
                 val finalMessage = message
                 runOnUiThread {
                     testButton.isEnabled = true
